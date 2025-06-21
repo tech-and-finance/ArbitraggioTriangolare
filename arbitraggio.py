@@ -18,6 +18,10 @@ try:
 except ImportError:
     psutil_available = False
 
+# Importa i nuovi moduli per il trading automatico
+import config
+from trading_executor import trading_worker_with_affinity
+
 # --- Configurazione del Logging ---
 # Rimuove i gestori di default per evitare log duplicati
 for handler in logging.root.handlers[:]:
@@ -435,7 +439,26 @@ def cpu_stress_test_worker(iterations):
     print(f"[STRESS][WORKER] PID: {os.getpid()} | Fine lavoro")
     return x
 
-async def main_loop(executor):
+async def handle_trading_result(future):
+    """Gestisce il risultato del trading asincrono"""
+    try:
+        # Timeout di 30 secondi per l'esecuzione
+        result = await asyncio.wait_for(future, timeout=config.TRADING_TIMEOUT)
+        log(f"Trading completato: {result.get('status', 'Unknown')}")
+        
+        if result.get('status') == 'SUCCESS':
+            profit_pct = result.get('profit_percentage', 0)
+            log(f"✅ Arbitraggio profittevole: {profit_pct:.4f}%")
+        elif result.get('status') == 'FAILED':
+            log(f"❌ Arbitraggio fallito: {result.get('error', 'Unknown error')}")
+            
+    except asyncio.TimeoutError:
+        log("⚠️ Trading timeout - processo ucciso")
+        # Il processo verrà terminato automaticamente
+    except Exception as e:
+        log(f"❌ Errore gestione risultato trading: {e}")
+
+async def main_loop(analysis_executor, trading_executor):
     """Ciclo principale che coordina i worker e gestisce i risultati."""
     global total_profitable_opportunities_found, total_low_profit_positive_found
     
@@ -453,7 +476,7 @@ async def main_loop(executor):
         
         all_currencies = sorted(list(set([info['base'] for info in symbol_info_map.values()] + [info['quote'] for info in symbol_info_map.values()])))
         
-        num_workers = executor._max_workers
+        num_workers = analysis_executor._max_workers
         chunk_size = (len(all_currencies) + num_workers - 1) // num_workers
         currency_chunks = [all_currencies[i:i + chunk_size] for i in range(0, len(all_currencies), chunk_size)]
         
@@ -466,7 +489,7 @@ async def main_loop(executor):
                 trade_graph[quote].append(base)
         # ------------------------------------
 
-        futures = [loop.run_in_executor(executor, find_arbitrage_worker, current_prices, symbol_info_map, PROFIT_THRESHOLD, TRADING_FEE, chunk, all_currencies, trade_graph) for chunk in currency_chunks]
+        futures = [loop.run_in_executor(analysis_executor, find_arbitrage_worker, current_prices, symbol_info_map, PROFIT_THRESHOLD, TRADING_FEE, chunk, all_currencies, trade_graph) for chunk in currency_chunks]
         
         aggregated_stats = {
             'total_triangles': 0,
@@ -525,6 +548,26 @@ async def main_loop(executor):
                         file_to_write = ANOMALIES_FILE if profit_perc_val > 50.0 else PROFITS_FILE
                         with open(file_to_write, "a", encoding="utf-8") as f:
                             f.write(log_line if profit_perc_val <= 50.0 else f"[ANOMALIA] {log_line}")
+                        
+                        # --- ESECUZIONE TRADING AUTOMATICO ---
+                        if config.AUTO_TRADE_ENABLED:
+                            # Prepara i dati per il trading
+                            trading_data = {
+                                'path': path,
+                                'pairs': opp.get('pairs', []),
+                                'prices': current_prices,
+                                'timestamp': time.time()
+                            }
+                            
+                            # Esegue in processo separato su core dedicato
+                            future = loop.run_in_executor(
+                                trading_executor,
+                                trading_worker_with_affinity,
+                                trading_data
+                            )
+                            
+                            # Gestisce il risultato
+                            asyncio.create_task(handle_trading_result(future))
 
             except Exception as e:
                 logger.error(f"Errore nel processare il risultato del worker: {e}")
@@ -626,6 +669,20 @@ async def hourly_summary_task(bot_start_time):
 
 async def main():
     global symbol_info_map
+    
+    # Stampa configurazione all'avvio
+    config.print_config_summary()
+    
+    # Validazione configurazione
+    if config.AUTO_TRADE_ENABLED:
+        errors = config.validate_config()
+        if errors:
+            logger.error("❌ Errori di configurazione rilevati:")
+            for error in errors:
+                logger.error(f"  - {error}")
+            logger.error("Il bot continuerà solo con l'analisi (trading disabilitato)")
+            config.AUTO_TRADE_ENABLED = False
+    
     getcontext().prec = 15
     bot_start_time = time.time()
     
@@ -639,10 +696,16 @@ async def main():
 
     symbol_groups = [symbols[i:i + SYMBOLS_PER_CONNECTION] for i in range(0, len(symbols), SYMBOLS_PER_CONNECTION)]
     
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-        websocket_tasks = [websocket_manager(group) for group in symbol_groups]
-        all_tasks = websocket_tasks + [main_loop(executor), monitor_performance_task(), hourly_summary_task(bot_start_time)]
-        await asyncio.gather(*all_tasks)
+    # Executor separati per analisi e trading
+    with ProcessPoolExecutor(max_workers=config.ANALYSIS_CORES) as analysis_executor:
+        with ProcessPoolExecutor(max_workers=config.TRADING_CORES) as trading_executor:
+            websocket_tasks = [websocket_manager(group) for group in symbol_groups]
+            all_tasks = websocket_tasks + [
+                main_loop(analysis_executor, trading_executor), 
+                monitor_performance_task(), 
+                hourly_summary_task(bot_start_time)
+            ]
+            await asyncio.gather(*all_tasks)
 
 if __name__ == "__main__":
     try:
