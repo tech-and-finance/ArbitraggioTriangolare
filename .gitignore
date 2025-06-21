@@ -1,0 +1,18 @@
+# Ambiente virtuale
+venv/
+/venv/
+
+# Cache di Python
+__pycache__/
+*.pyc
+
+# File di log generati
+# Ignora tutti i file .txt
+*.txt
+# Ma non ignorare requirements.txt
+!requirements.txt
+*.log
+
+# File specifici di alcuni editor di codice
+.vscode/
+.idea/ 
