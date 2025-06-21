@@ -18,28 +18,44 @@ try:
 except ImportError:
     psutil_available = False
 
-# Configurazione Telegram
-TELEGRAM_CONFIG = {
-    'bot_token': '8182228673:AAEwknPEkwI_vp8froD8rNEquaK88W3EukQ',
-    'chat_id': '279229754'
-}
+# --- Configurazione del Logging ---
+# Rimuove i gestori di default per evitare log duplicati
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+# Configura il logger principale
+logging.basicConfig(level=logging.INFO,
+                    format='[%(asctime)s] [%(levelname)s] %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S',
+                    handlers=[logging.StreamHandler()],
+                    encoding='utf-8')
+logger = logging.getLogger(__name__)
 
 # --- Costanti di Configurazione ---
 SYMBOLS_PER_CONNECTION = 200  # Numero di simboli per connessione WebSocket
 PROFIT_THRESHOLD = Decimal("0.001")  # Profitto minimo netto per notifica (0.1%)
-TRADING_FEE = Decimal("0.001")      # Commissione per ogni trade (0.1%)
+TRADING_FEE = Decimal("0.00075")      # Commissione per ogni trade (0.075% con sconto BNB)
 STARTING_CAPITAL_USDT = Decimal("100") # Capitale iniziale per la simulazione
 ARBITRAGE_CHECK_INTERVAL = 120  # Secondi tra i controlli di arbitraggio (2 minuti)
-TELEGRAM_COOLDOWN = 5  # Secondi di attesa tra notifiche Telegram per evitare rate-limit
-STABLECOINS = {'USDT', 'USDC', 'FDUSD'} # Valute stabili da cui iniziare l'arbitraggio
-# --------------------------------
+STARTING_ASSETS = {'USDT', 'USDC', 'FDUSD', 'DAI', 'TUSD', 'BTC', 'ETH', 'SOL'} # Asset di partenza per l'analisi di arbitraggio
+SIMULATION_CAPITAL = Decimal("100") # Capitale di simulazione in valuta di partenza
+OPPORTUNITY_COOLDOWN = 60  # Secondi prima di notificare di nuovo lo stesso triangolo
 
-# Cache globale per ottimizzazioni
-arbitrage_cache = {}
-last_arbitrage_check = 0
-cached_currencies = set()
-cached_pairs = {}
-last_telegram_time = 0
+# --- File di Log ---
+PROFITS_FILE = "profitable_opportunities.txt"
+ANOMALIES_FILE = "anomalies.txt"
+
+# --- Variabili Globali ---
+prices_cache = {}
+symbol_info_map = {}
+last_check_time = datetime.now()
+profitable_opportunities_set = {}
+total_profitable_opportunities_found = 0
+total_low_profit_positive_found = 0
+
+# Configurazione Telegram (caricata da variabili d'ambiente o file)
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8182228673:AAEwknPEkwI_vp8froD8rNEquaK88W3EukQ')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '279229754')
 
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {msg}")
@@ -55,9 +71,9 @@ msg_count = 0  # Contatore globale dei messaggi WebSocket
 
 # Funzione per inviare messaggio Telegram
 def send_telegram_message(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_CONFIG['bot_token']}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
-        'chat_id': TELEGRAM_CONFIG['chat_id'],
+        'chat_id': TELEGRAM_CHAT_ID,
         'text': text,
         'parse_mode': 'Markdown'  # Abilita la formattazione Markdown
     }
@@ -152,42 +168,47 @@ async def monitor_performance(process):
         log(f"[PERF] CPU: {cpu_display} | RAM: {ram_display} | Simboli cache: {len(current_price_map)} | Msg/s: {msgs/5:.0f}")
 
 async def get_exchange_symbols():
-    """Ottiene i simboli e le loro info per l'arbitraggio con USDT."""
+    """Ottiene i simboli e le loro info, focalizzandosi sulle coppie legate agli asset di partenza."""
     try:
         url = "https://api.binance.com/api/v3/exchangeInfo"
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         data = response.json()
-        
+
         trading_symbols = {s['symbol']: s for s in data['symbols'] if s['status'] == 'TRADING'}
 
-        usdt_related_currencies = {'USDT'}
-        for symbol_info in trading_symbols.values():
-            if symbol_info['quoteAsset'] == 'USDT':
-                usdt_related_currencies.add(symbol_info['baseAsset'])
+        # Filtra per le valute che hanno una coppia diretta con gli asset di partenza per limitare il campo
+        relevant_currencies = set(STARTING_ASSETS)
+        for symbol, info in trading_symbols.items():
+            if info['quoteAsset'] in STARTING_ASSETS:
+                relevant_currencies.add(info['baseAsset'])
+            if info['baseAsset'] in STARTING_ASSETS:
+                relevant_currencies.add(info['quoteAsset'])
 
         symbols_to_subscribe = set()
-        symbol_info_map = {}
+        temp_symbol_info_map = {}
         for symbol, info in trading_symbols.items():
-            if info['baseAsset'] in usdt_related_currencies and info['quoteAsset'] in usdt_related_currencies:
+            if info['baseAsset'] in relevant_currencies and info['quoteAsset'] in relevant_currencies:
                 symbols_to_subscribe.add(symbol)
-                # Estrai minQty dal filtro LOT_SIZE
-                min_qty = Decimal("0")
+                
+                min_qty, min_notional, step_size = Decimal("0"), Decimal("0"), Decimal("0")
                 for f in info['filters']:
                     if f['filterType'] == 'LOT_SIZE':
                         min_qty = Decimal(f['minQty'])
-                        break
-                symbol_info_map[symbol] = {
-                    'base': info['baseAsset'], 
-                    'quote': info['quoteAsset'],
-                    'minQty': min_qty
+                        step_size = Decimal(f['stepSize'])
+                    elif f['filterType'] == 'NOTIONAL' or f['filterType'] == 'MIN_NOTIONAL':
+                        min_notional = Decimal(f.get('notional', f.get('minNotional', "0")))
+
+                temp_symbol_info_map[symbol] = {
+                    'base': info['baseAsset'], 'quote': info['quoteAsset'],
+                    'minQty': min_qty, 'minNotional': min_notional, 'stepSize': step_size
                 }
         
         formatted_symbols = [s.lower() + "@bookTicker" for s in sorted(list(symbols_to_subscribe))]
-        log(f"[LOG] Ottenuti {len(formatted_symbols)} simboli per l'arbitraggio con USDT.")
-        return formatted_symbols, symbol_info_map
+        logger.info(f"Ottenuti {len(formatted_symbols)} simboli per l'arbitraggio (legati a {', '.join(sorted(list(STARTING_ASSETS)))}).")
+        return formatted_symbols, temp_symbol_info_map
     except Exception as e:
-        log(f"[LOG][ERRORE] Impossibile ottenere i simboli: {e}")
+        logger.error(f"Impossibile ottenere i simboli: {e}")
         return [], {}
 
 async def handle_message(msg):
@@ -200,7 +221,7 @@ async def handle_message(msg):
         data = data['data']
     
     symbol = data['s']
-    price_map[symbol] = {
+    prices_cache[symbol] = {
         'bid': Decimal(data['b']), 
         'ask': Decimal(data['a']),
         'bid_qty': Decimal(data['B']),
@@ -261,166 +282,150 @@ def format_opportunity_message(opp, prices):
         log(f"[MSG][ERR] Errore critico nella formattazione: {e} per opp: {opp}")
         return f"🚨 Errore nella formattazione del messaggio per `{opp.get('path', 'N/A')}`"
 
-def find_arbitrage_worker(prices, symbol_info_map, profit_threshold, trading_fee, currency_chunk, all_currencies, pair_set):
-    """
-    Genera e calcola le opportunità di arbitraggio per un sottoinsieme di valute,
-    simulando un trade con un capitale fisso per verificare la liquidità.
-    """
-    from decimal import Decimal
-    from itertools import permutations
+def adjust_quantity_for_step_size(quantity, step_size):
+    """Arrotonda per difetto la quantità per conformarla allo stepSize di Binance."""
+    if step_size > 0:
+        return (quantity // step_size) * step_size
+    return quantity
 
-    results = []
-    permutazioni_processate = 0
-    permutazioni_valide = 0
+def find_arbitrage_worker(prices, symbol_info_map_local, profit_threshold, trading_fee, currency_chunk, all_currencies, trade_graph):
+    """Processo worker che cerca opportunità di arbitraggio navigando un grafo pre-calcolato."""
+    profitable_opportunities = []
+    stats = {
+        'total_triangles': 0,
+        'non_priority_start': 0,
+        'low_profit': {'negative': 0, 'positive': 0},
+        'simulation_failures': {
+            'total': 0,
+            'FAIL_NO_DATA': 0,
+            'FAIL_STEP_SIZE': 0,
+            'FAIL_MIN_QTY': 0,
+            'FAIL_LIQUIDITY': 0,
+            'FAIL_MIN_NOTIONAL': 0,
+            'UNKNOWN': 0
+        }
+    }
     
-    SIMULATION_CAPITAL = Decimal('100') # Simula un trade con 100 USDT (o equivalente)
+    existing_pairs = {c: {} for c in all_currencies}
+    for symbol, info in symbol_info_map_local.items():
+        base, quote = info['base'], info['quote']
+        if base not in existing_pairs:
+            existing_pairs[base] = {}
+        existing_pairs[base][quote] = symbol
 
-    cached_pairs = {}
-    for symbol, info in symbol_info_map.items():
-        if symbol in prices:
-            cached_pairs[(info['base'], info['quote'])] = symbol
-            cached_pairs[(info['quote'], info['base'])] = symbol
-
-    for a in currency_chunk:
-        for b in all_currencies:
-            if b == a or (a, b) not in pair_set: continue
-            for c in all_currencies:
-                if c == a or c == b: continue
-                if (b, c) not in pair_set or (c, a) not in pair_set: continue
+    # Naviga il grafo per trovare solo percorsi validi
+    for p_a in currency_chunk:
+        # p_a deve essere nel grafo
+        if p_a not in trade_graph: continue
+        
+        # Livello 1: p_a -> p_b
+        for p_b in trade_graph[p_a]:
+            # Livello 2: p_b -> p_c
+            if p_b not in trade_graph: continue
+            for p_c in trade_graph[p_b]:
+                # Non vogliamo loop semplici come A->B->A
+                if p_c == p_a: continue
                 
-                for p_a, p_b, p_c in permutations((a, b, c), 3):
-                    permutazioni_processate += 1
-                    try:
-                        # --- Inizio Simulazione Trade ---
-                        
-                        # STEP 1: p_a -> p_b
-                        amount1 = SIMULATION_CAPITAL if p_a in STABLECOINS else Decimal(0)
-                        rate1, price1, pair1_str = Decimal(0), Decimal(0), ""
-                        
-                        if (p_b, p_a) in cached_pairs and cached_pairs[(p_b, p_a)] in prices: # Vendi p_a per p_b (compri p_b)
-                            symbol1 = cached_pairs[(p_b, p_a)]
-                            book = prices[symbol1]
-                            if book['ask'] > 0 and book['ask_qty'] > 0:
-                                price1 = book['ask']
-                                rate1 = Decimal(1) / price1
-                                # Se non partiamo da stablecoin, non possiamo iniziare la simulazione del capitale
-                                if p_a not in STABLECOINS: continue
-                                
-                                amount_to_buy = SIMULATION_CAPITAL / price1 # Quanto p_b compriamo
-                                if amount_to_buy > book['ask_qty']: continue # Non c'è abbastanza liquidità
-
-                                amount1 = amount_to_buy
-                                pair1_str = symbol1
-                        elif (p_a, p_b) in cached_pairs and cached_pairs[(p_a, p_b)] in prices: # Vendi p_a per p_b (compri p_b)
-                            symbol1 = cached_pairs[(p_a, p_b)]
-                            book = prices[symbol1]
-                            if book['bid'] > 0 and book['bid_qty'] > 0:
-                                price1 = book['bid']
-                                rate1 = price1
-                                # Se non partiamo da stablecoin, non possiamo iniziare la simulazione del capitale
-                                if p_a not in STABLECOINS: continue
-                                
-                                amount_to_sell = SIMULATION_CAPITAL # Quanto p_a vendiamo
-                                if amount_to_sell > book['bid_qty']: continue # Non c'è abbastanza liquidità
-                                
-                                amount1 = amount_to_sell * price1
-                                pair1_str = symbol1
-
-                        if rate1 == 0 or amount1 == 0: continue
-                        amount1_after_fee = amount1 * (Decimal(1) - trading_fee)
-
-                        # STEP 2: p_b -> p_c
-                        amount2 = Decimal(0)
-                        rate2, price2, pair2_str = Decimal(0), Decimal(0), ""
-                        if (p_c, p_b) in cached_pairs and cached_pairs[(p_c, p_b)] in prices:
-                            symbol2 = cached_pairs[(p_c, p_b)]
-                            book = prices[symbol2]
-                            if book['ask'] > 0 and book['ask_qty'] > 0:
-                                price2 = book['ask']
-                                rate2 = Decimal(1) / price2
-                                amount_to_buy = amount1_after_fee / price2
-                                if amount_to_buy > book['ask_qty']: continue
-                                amount2 = amount_to_buy
-                                pair2_str = symbol2
-                        elif (p_b, p_c) in cached_pairs and cached_pairs[(p_b, p_c)] in prices:
-                            symbol2 = cached_pairs[(p_b, p_c)]
-                            book = prices[symbol2]
-                            if book['bid'] > 0 and book['bid_qty'] > 0:
-                                price2 = book['bid']
-                                rate2 = price2
-                                amount_to_sell = amount1_after_fee
-                                if amount_to_sell > book['bid_qty']: continue
-                                amount2 = amount_to_sell * price2
-                                pair2_str = symbol2
-                        
-                        if rate2 == 0 or amount2 == 0: continue
-                        amount2_after_fee = amount2 * (Decimal(1) - trading_fee)
-
-                        # STEP 3: p_c -> p_a
-                        amount3 = Decimal(0)
-                        rate3, price3, pair3_str = Decimal(0), Decimal(0), ""
-                        if (p_a, p_c) in cached_pairs and cached_pairs[(p_a, p_c)] in prices:
-                            symbol3 = cached_pairs[(p_a, p_c)]
-                            book = prices[symbol3]
-                            if book['ask'] > 0 and book['ask_qty'] > 0:
-                                price3 = book['ask']
-                                rate3 = Decimal(1) / price3
-                                amount_to_buy = amount2_after_fee / price3
-                                if amount_to_buy > book['ask_qty']: continue
-                                amount3 = amount_to_buy
-                                pair3_str = symbol3
-                        elif (p_c, p_a) in cached_pairs and cached_pairs[(p_c, p_a)] in prices:
-                            symbol3 = cached_pairs[(p_c, p_a)]
-                            book = prices[symbol3]
-                            if book['bid'] > 0 and book['bid_qty'] > 0:
-                                price3 = book['bid']
-                                rate3 = price3
-                                amount_to_sell = amount2_after_fee
-                                if amount_to_sell > book['bid_qty']: continue
-                                amount3 = amount_to_sell * price3
-                                pair3_str = symbol3
-
-                        if rate3 == 0 or amount3 == 0: continue
-                        final_amount = amount3 * (Decimal(1) - trading_fee)
-
-                        # --- Fine Simulazione Trade ---
-                        permutazioni_valide += 1
-                        
-                        net_profit = (final_amount / SIMULATION_CAPITAL) - Decimal(1) if SIMULATION_CAPITAL > 0 else Decimal(0)
-                        profitto_lordo = (rate1 * rate2 * rate3) - 1
-
-                        path_str = f"{p_a}→{p_b}→{p_c}→{p_a}"
-
-                        if profitto_lordo > Decimal('0.5'):
-                            # ... (il codice per le anomalie rimane simile, omettiamolo per brevità)
-                            continue
-                        
-                        details = {
-                            'rates': tuple(str(r) for r in (rate1, rate2, rate3)),
-                            'pairs': (pair1_str, pair2_str, pair3_str),
-                            'prices': tuple(str(p) for p in (price1, price2, price3))
-                        }
-                        opp = {
-                            'path': path_str,
-                            'profit': str(net_profit),
-                            'final': str(final_amount),
-                            'details': details,
-                            'profitto_lordo': str(profitto_lordo)
-                        }
-                        
-                        if net_profit > profit_threshold:
-                            opp['note'] = 'PROFITTEVOLE'
-                            results.append({'type': 'profitable', 'opp': opp})
-                        elif net_profit > 0:
-                            opp['note'] = 'QUASI PROFITTEVOLE'
-                            results.append({'type': 'quasi', 'opp': opp})
-                        else:
-                            # Non inviare più le opportunità scartate
-                            pass
-                    except Exception as e:
-                        # Loggare l'errore qui sarebbe utile in futuro
+                # Livello 3: Controlla se p_c può tornare a p_a
+                if p_c in trade_graph and p_a in trade_graph[p_c]:
+                    stats['total_triangles'] += 1
+                    
+                    # Simula solo percorsi che iniziano con un asset prioritario
+                    if p_a not in STARTING_ASSETS:
+                        stats['non_priority_start'] += 1
                         continue
-    return results, permutazioni_processate, permutazioni_valide
+
+                    try:
+                        status, result = simulate_trade(p_a, p_b, SIMULATION_CAPITAL, prices, symbol_info_map_local, existing_pairs)
+                        if status != 'SUCCESS':
+                            stats['simulation_failures']['total'] += 1
+                            stats['simulation_failures'][status] = stats['simulation_failures'].get(status, 0) + 1
+                            continue
+                        rate1, amount1, pair1_str = result
+
+                        amount1_after_fee = amount1 * (1 - trading_fee)
+
+                        status, result = simulate_trade(p_b, p_c, amount1_after_fee, prices, symbol_info_map_local, existing_pairs)
+                        if status != 'SUCCESS':
+                            stats['simulation_failures']['total'] += 1
+                            stats['simulation_failures'][status] = stats['simulation_failures'].get(status, 0) + 1
+                            continue
+                        rate2, amount2, pair2_str = result
+
+                        amount2_after_fee = amount2 * (1 - trading_fee)
+
+                        status, result = simulate_trade(p_c, p_a, amount2_after_fee, prices, symbol_info_map_local, existing_pairs)
+                        if status != 'SUCCESS':
+                            stats['simulation_failures']['total'] += 1
+                            stats['simulation_failures'][status] = stats['simulation_failures'].get(status, 0) + 1
+                            continue
+                        rate3, amount3, pair3_str = result
+                        
+                        final_amount = amount3 * (1 - trading_fee)
+                        profit = final_amount - SIMULATION_CAPITAL
+                        
+                        if profit > (SIMULATION_CAPITAL * profit_threshold / 100):
+                             profit_perc = (profit / SIMULATION_CAPITAL) * 100
+                             profitable_opportunities.append({
+                                'path': f"{p_a}→{p_b}→{p_c}→{p_a}",
+                                'profit_perc': f"{profit_perc:.4f}",
+                                'pairs': [pair1_str, pair2_str, pair3_str]
+                            })
+                        else:
+                            if profit < 0:
+                                stats['low_profit']['negative'] += 1
+                            else:
+                                stats['low_profit']['positive'] += 1
+
+                    except Exception:
+                        stats['simulation_failures']['total'] += 1
+                        stats['simulation_failures']['UNKNOWN'] += 1
+                        continue
+                        
+    return {'profitable': profitable_opportunities, 'stats': stats}
+
+def simulate_trade(start_asset, end_asset, amount_in, prices, symbol_info, existing_pairs):
+    """
+    Simula un singolo trade.
+    Restituisce ('SUCCESS', (rate, amount_out, symbol)) o ('FAIL_REASON', None).
+    """
+    # Compra end_asset con start_asset (coppia: end_asset/start_asset)
+    if end_asset in existing_pairs and start_asset in existing_pairs[end_asset]:
+        symbol = existing_pairs[end_asset][start_asset]
+        info = symbol_info.get(symbol)
+        book = prices.get(symbol)
+        if not info or not book or book['ask'] == 0: return 'FAIL_NO_DATA', None
+        
+        price = book['ask']
+        quantity_to_buy = adjust_quantity_for_step_size(amount_in / price, info['stepSize'])
+        if quantity_to_buy == 0: return 'FAIL_STEP_SIZE', None
+        
+        notional_value = quantity_to_buy * price
+        if quantity_to_buy < info['minQty']: return 'FAIL_MIN_QTY', None
+        if quantity_to_buy > book['ask_qty']: return 'FAIL_LIQUIDITY', None
+        if notional_value < info['minNotional']: return 'FAIL_MIN_NOTIONAL', None
+
+        return 'SUCCESS', (Decimal(1) / price, quantity_to_buy, symbol)
+
+    # Vendi start_asset per end_asset (coppia: start_asset/end_asset)
+    elif start_asset in existing_pairs and end_asset in existing_pairs[start_asset]:
+        symbol = existing_pairs[start_asset][end_asset]
+        info = symbol_info.get(symbol)
+        book = prices.get(symbol)
+        if not info or not book or book['bid'] == 0: return 'FAIL_NO_DATA', None
+
+        price = book['bid']
+        quantity_to_sell = adjust_quantity_for_step_size(amount_in, info['stepSize'])
+        if quantity_to_sell == 0: return 'FAIL_STEP_SIZE', None
+
+        notional_value = quantity_to_sell * price
+        if quantity_to_sell < info['minQty']: return 'FAIL_MIN_QTY', None
+        if quantity_to_sell > book['bid_qty']: return 'FAIL_LIQUIDITY', None
+        if notional_value < info['minNotional']: return 'FAIL_MIN_NOTIONAL', None
+
+        return 'SUCCESS', (price, notional_value, symbol)
+
+    return 'FAIL_NO_DATA', None # Se la coppia non esiste in nessuna direzione
 
 def cpu_stress_test_worker(iterations):
     print(f"[STRESS][WORKER] PID: {os.getpid()} | Iterazioni: {iterations}")
@@ -430,249 +435,219 @@ def cpu_stress_test_worker(iterations):
     print(f"[STRESS][WORKER] PID: {os.getpid()} | Fine lavoro")
     return x
 
-async def check_arbitrage(symbol_info_map, executor):
-    log("[LOG] Attendo 10 secondi per riempire la cache dei prezzi...")
-    await asyncio.sleep(10)
-    log("[LOG] Inizio controllo opportunità di arbitraggio...")
+async def main_loop(executor):
+    """Ciclo principale che coordina i worker e gestisce i risultati."""
+    global total_profitable_opportunities_found, total_low_profit_positive_found
     
-    global last_telegram_time
-
     while True:
+        await asyncio.sleep(5) 
+        if not symbol_info_map:
+            logger.info("Mappa dei simboli non ancora pronta, attendo...")
+            continue
+        
+        logger.info("Inizio controllo opportunità di arbitraggio...")
         start_time = time.perf_counter()
-        current_price_map = price_map.copy()
 
-        active_currencies_set = set()
-        for symbol, info in symbol_info_map.items():
-            if symbol in current_price_map:
-                active_currencies_set.add(info['base'])
-                active_currencies_set.add(info['quote'])
-        active_currencies = list(active_currencies_set)
-        
-        pair_set = set()
-        for symbol in current_price_map:
-            if symbol in symbol_info_map:
-                base = symbol_info_map[symbol]['base']
-                quote = symbol_info_map[symbol]['quote']
-                pair_set.add((base, quote))
-                pair_set.add((quote, base))
-
-        if not active_currencies:
-            log("[LOG] Nessuna valuta attiva trovata in questo ciclo.")
-            await asyncio.sleep(ARBITRAGE_CHECK_INTERVAL)
-            continue
-
-        num_workers = os.cpu_count() or 2
-        chunk_size = ceil(len(active_currencies) / num_workers)
-        if chunk_size == 0:
-            log("[LOG] Nessuna valuta da processare.")
-            await asyncio.sleep(ARBITRAGE_CHECK_INTERVAL)
-            continue
-            
-        currency_chunks = [active_currencies[i:i + chunk_size] for i in range(0, len(active_currencies), chunk_size)]
-        
+        current_prices = dict(prices_cache)
         loop = asyncio.get_running_loop()
-        tasks = [loop.run_in_executor(executor, find_arbitrage_worker, current_price_map, symbol_info_map, PROFIT_THRESHOLD, TRADING_FEE, chunk, active_currencies, pair_set) for chunk in currency_chunks]
         
-        arbitrage_opps = []
-        opportunita_quasi_profit = 0
-        opportunita_lorde = 0
-        profitti_lordi = []
-        profitti_netto = []
-        total_permutations_processed = 0
-        total_permutations_valid = 0
+        all_currencies = sorted(list(set([info['base'] for info in symbol_info_map.values()] + [info['quote'] for info in symbol_info_map.values()])))
         
-        processed_triangles = set() # Aggiunto per de-duplicare i triangoli
+        num_workers = executor._max_workers
+        chunk_size = (len(all_currencies) + num_workers - 1) // num_workers
+        currency_chunks = [all_currencies[i:i + chunk_size] for i in range(0, len(all_currencies), chunk_size)]
+        
+        # --- Costruzione del Grafo di Trading ---
+        trade_graph = {c: [] for c in all_currencies}
+        for symbol, info in symbol_info_map.items():
+            base, quote = info['base'], info['quote']
+            if base in trade_graph and quote in trade_graph:
+                trade_graph[base].append(quote)
+                trade_graph[quote].append(base)
+        # ------------------------------------
 
-        # Sostituisci gather con as_completed per un'elaborazione non bloccante
-        for future in asyncio.as_completed(tasks):
-            worker_results, perms_processed, perms_valid = await future
-            total_permutations_processed += perms_processed
-            total_permutations_valid += perms_valid
-            
-            for res in worker_results:
-                if res['type'] == 'anomaly':
-                    log(f"[ANOMALIA] Profitto lordo anomalo ({res['profit']*100:.2f}%) scartato per {res['path']}")
-                    log(f"  Tassi: {res['rates'][0]:.6f} * {res['rates'][1]:.6f} * {res['rates'][2]:.6f}")
-                    log(f"  Prezzi: {res['prices'][0]:.6f}, {res['prices'][1]:.6f}, {res['prices'][2]:.6f}")
-                else:
-                    opp = res['opp']
+        futures = [loop.run_in_executor(executor, find_arbitrage_worker, current_prices, symbol_info_map, PROFIT_THRESHOLD, TRADING_FEE, chunk, all_currencies, trade_graph) for chunk in currency_chunks]
+        
+        aggregated_stats = {
+            'total_triangles': 0,
+            'non_priority_start': 0,
+            'low_profit': {'negative': 0, 'positive': 0},
+            'simulation_failures': {
+                'total': 0, 'FAIL_NO_DATA': 0, 'FAIL_STEP_SIZE': 0,
+                'FAIL_MIN_QTY': 0, 'FAIL_LIQUIDITY': 0, 'FAIL_MIN_NOTIONAL': 0,
+                'UNKNOWN': 0
+            }
+        }
+        total_profitable_found = 0
+
+        for future in asyncio.as_completed(futures):
+            try:
+                worker_result = await future
+                opportunities = worker_result.get('profitable', [])
+                worker_stats = worker_result.get('stats', {})
+
+                # Aggrega le statistiche
+                if worker_stats:
+                    aggregated_stats['total_triangles'] += worker_stats.get('total_triangles', 0)
+                    aggregated_stats['non_priority_start'] += worker_stats.get('non_priority_start', 0)
                     
-                    # --- Logica di de-duplicazione del triangolo ---
-                    path_currencies = set(opp['path'].split('→')[:3])
-                    canonical_triangle = tuple(sorted(list(path_currencies)))
-                    if canonical_triangle in processed_triangles:
-                        continue # Triangolo già processato in questo ciclo, ignora.
+                    # Aggrega low_profit
+                    low_profit_stats = worker_stats.get('low_profit', {})
+                    aggregated_stats['low_profit']['negative'] += low_profit_stats.get('negative', 0)
+                    aggregated_stats['low_profit']['positive'] += low_profit_stats.get('positive', 0)
 
-                    # Converti i profitti da stringa a Decimal per i calcoli corretti
-                    profitto_lordo_dec = Decimal(opp['profitto_lordo'])
+                    # Aggrega simulation_failures
+                    sim_fail_stats = worker_stats.get('simulation_failures', {})
+                    for key, value in sim_fail_stats.items():
+                        aggregated_stats['simulation_failures'][key] += value
+
+                if not opportunities: continue
+                
+                total_profitable_found += len(opportunities)
+
+                for opp in opportunities:
+                    path, profit_perc_str = opp.get('path'), opp.get('profit_perc')
+                    if not path: continue
                     
-                    profitti_lordi.append(float(profitto_lordo_dec))
-                    profitti_netto.append(float(opp['profit']))
+                    triangle_key = tuple(sorted(path.split('→')[:3]))
+                    current_time = time.time()
                     
-                    if profitto_lordo_dec > 0:
-                        opportunita_lorde += 1
-
-                    # --- Logica di filtro e logging disaccoppiata ---
-                    
-                    # 1. Determina se il percorso è preferito
-                    starting_currency = opp['path'].split('→')[0]
-                    is_stablecoin_in_path = any(c in STABLECOINS for c in path_currencies)
-                    is_preferred_path = not (is_stablecoin_in_path and starting_currency not in STABLECOINS)
-
-                    # 2. Salva SEMPRE sul file di log giornaliero. Se il percorso non è preferito,
-                    # la nota originale ('PROFITTEVOLE', etc.) viene sovrascritta per chiarezza.
-                    if not is_preferred_path:
-                        opp['note'] = 'IGNORATO (NON PREFERITO)'
-                    
-                    if res['type'] != 'scartata': # Logga tutto tranne le non-profittevoli per pulizia
-                        save_opportunity_to_file(opp)
-
-                    # 3. Se il percorso non è preferito, interrompi qui l'elaborazione
-                    if not is_preferred_path:
-                        if res['type'] != 'scartata':
-                             log(f"[SKIP] Percorso {opp['path']} ignorato. Si preferisce la partenza da stablecoin.")
-                        continue
-
-                    # --- Da qui in poi, processiamo solo i percorsi PREFERITI ---
-
-                    # Segna il triangolo come processato per evitare duplicati nelle notifiche/log profittevoli
-                    if res['type'] == 'profitable' or res['type'] == 'quasi':
-                        processed_triangles.add(canonical_triangle)
-
-                    if res['type'] == 'profitable':
-                        arbitrage_opps.append(opp)
-                        save_profitable_opportunity(opp) # Ora riceve solo percorsi preferiti
+                    if (current_time - profitable_opportunities_set.get(triangle_key, 0)) > OPPORTUNITY_COOLDOWN:
+                        profitable_opportunities_set[triangle_key] = current_time
+                        total_profitable_opportunities_found += 1 # Incrementa il contatore globale
                         
-                        now = time.perf_counter()
-                        if now - last_telegram_time > TELEGRAM_COOLDOWN:
-                            msg = format_opportunity_message(opp, current_price_map)
-                            send_telegram_message(msg)
-                            last_telegram_time = now
-                        else:
-                            log(f"[TELEGRAM][SKIP] Notifica per {opp['path']} saltata (cooldown).")
-
-                    elif res['type'] == 'quasi':
-                        opportunita_quasi_profit += 1
+                        await send_telegram_notification(format_opportunity_message(opp, current_prices))
                         
-                        now = time.perf_counter()
-                        if now - last_telegram_time > TELEGRAM_COOLDOWN:
-                            msg = format_opportunity_message(opp, current_price_map)
-                            msg = "⚠️ *QUASI ARBITRAGGIO*\n\n" + msg
-                            send_telegram_message(msg)
-                            last_telegram_time = now
-                        else:
-                            log(f"[TELEGRAM][SKIP] Notifica per {opp['path']} saltata (cooldown).")
-        
-        duration = (time.perf_counter() - start_time) * 1000
-        profitto_lordo_medio = (sum(profitti_lordi) / len(profitti_lordi)) if profitti_lordi else 0
-        profitto_netto_medio = (sum(profitti_netto) / len(profitti_netto)) if profitti_netto else 0
-        
-        log(f"[PERF] Ciclo completato in {duration:.2f}ms | Valute: {len(active_currencies)} | Permutazioni: {total_permutations_processed:,}/{total_permutations_valid:,} | Lorde: {opportunita_lorde} | Nette: {len(arbitrage_opps)} | Quasi: {opportunita_quasi_profit} | Profitto Med. Lordo: {profitto_lordo_medio*100:.4f}% | Netto: {profitto_netto_medio*100:.4f}%")
-        
-        await asyncio.sleep(ARBITRAGE_CHECK_INTERVAL)
+                        profit_perc_val = float(profit_perc_str)
+                        guadagno_stimato = 100 * (profit_perc_val / 100)
+                        log_line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} | {path} | Profitto Netto: {profit_perc_val:.4f}% | Guadagno Stimato (100 USDT): {guadagno_stimato:.4f} USDT\n"
+                        
+                        file_to_write = ANOMALIES_FILE if profit_perc_val > 50.0 else PROFITS_FILE
+                        with open(file_to_write, "a", encoding="utf-8") as f:
+                            f.write(log_line if profit_perc_val <= 50.0 else f"[ANOMALIA] {log_line}")
 
-async def create_websocket_connection(symbols):
-    """Crea una connessione WebSocket per un gruppo di simboli"""
-    streams_url = f"{WS_URL}?streams={'/'.join(symbols)}"
-    log(f"[LOG] Creazione connessione per {len(symbols)} simboli...")
-    
+            except Exception as e:
+                logger.error(f"Errore nel processare il risultato del worker: {e}")
+        
+        # Aggiorna il contatore globale dei quasi-profittevoli
+        total_low_profit_positive_found += aggregated_stats['low_profit']['positive']
+
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        total_low_profit = aggregated_stats['low_profit']['negative'] + aggregated_stats['low_profit']['positive']
+        total_sim_failures = aggregated_stats['simulation_failures']['total']
+
+        logger.info("--- Statistiche Ciclo di Analisi ---")
+        logger.info(f"Durata Analisi: {duration_ms:.2f} ms")
+        logger.info(f"Triangoli validi trovati: {aggregated_stats['total_triangles']:,}")
+        logger.info(f"  - Scartati (partenza non prioritaria): {aggregated_stats['non_priority_start']:,}")
+        logger.info(f"  - Scartati (fallimento simulazione): {total_sim_failures:,}")
+        
+        if total_sim_failures > 0:
+            sim_failures = aggregated_stats['simulation_failures']
+            logger.info(f"    - Liquidità insufficiente: {sim_failures.get('FAIL_LIQUIDITY', 0):,}")
+            logger.info(f"    - Valore nozionale minimo: {sim_failures.get('FAIL_MIN_NOTIONAL', 0):,}")
+            logger.info(f"    - Quantità minima non raggiunta: {sim_failures.get('FAIL_MIN_QTY', 0):,}")
+            logger.info(f"    - Quantità zero per stepSize: {sim_failures.get('FAIL_STEP_SIZE', 0):,}")
+            logger.info(f"    - Dati/Prezzo mancanti: {sim_failures.get('FAIL_NO_DATA', 0):,}")
+            if sim_failures.get('UNKNOWN', 0) > 0:
+                 logger.info(f"    - Sconosciuto/Altro: {sim_failures.get('UNKNOWN', 0):,}")
+
+        logger.info(f"  - Scartati (profitto troppo basso): {total_low_profit:,}")
+        if total_low_profit > 0:
+            logger.info(f"    - Negativo (perdita): {aggregated_stats['low_profit']['negative']:,}")
+            logger.info(f"    - Positivo (sotto soglia): {aggregated_stats['low_profit']['positive']:,}")
+        logger.info(f"Opportunità Profittevoli Trovate: {total_profitable_found}")
+        logger.info("------------------------------------")
+
+async def send_telegram_notification(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        websocket = await websockets.connect(
-            streams_url,
-            ping_interval=20,
-            ping_timeout=60
-        )
-        log(f"[LOG] Connessione WebSocket stabilita per {len(symbols)} simboli")
-        return websocket
+        async with asyncio.timeout(10):
+            response = requests.post(url, data={'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'Markdown'})
+            if response.status_code != 200:
+                logger.warning(f"Errore invio Telegram: {response.status_code} {response.text}")
     except Exception as e:
-        log(f"[LOG][ERRORE] Impossibile creare connessione WebSocket: {e}")
-        return None
+        logger.error(f"Eccezione invio Telegram: {e}")
 
-async def handle_websocket_connection_with_reconnect(symbols, reconnect_delay=5):
-    """Gestisce una connessione WebSocket con riconnessione automatica."""
+async def websocket_manager(symbols):
+    """Gestisce una singola connessione WebSocket con riconnessione."""
+    url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(symbols)}"
     while True:
-        websocket = None
         try:
-            websocket = await create_websocket_connection(symbols)
-            if websocket is None:
-                log(f"[RECONNECT] Impossibile creare la connessione WebSocket. Riprovo tra {reconnect_delay}s...")
-                send_telegram_message(f"[RECONNECT] Impossibile creare la connessione WebSocket. Riprovo tra {reconnect_delay}s...")
-                await asyncio.sleep(reconnect_delay)
-                continue
-            log(f"[RECONNECT] Connessione WebSocket (re)stabilita per {len(symbols)} simboli.")
-            send_telegram_message(f"[RECONNECT] Connessione WebSocket (re)stabilita per {len(symbols)} simboli.")
-            last_msg_time = time.time()
-            while True:
-                try:
-                    msg = await websocket.recv()
-                    now = time.time()
-                    if now - last_msg_time > 5:
-                        log(f"[DEBUG][WS] {now - last_msg_time:.2f}s dall'ultimo messaggio WebSocket!")
-                    last_msg_time = now
-                    await handle_message(msg)
-                except Exception as e:
-                    log(f"[RECONNECT][ERRORE] Errore nella ricezione messaggi WebSocket: {e}")
-                    send_telegram_message(f"[RECONNECT][ERRORE] Errore WebSocket: {e}. Riconnessione tra {reconnect_delay}s...")
-                    break
+            async with websockets.connect(url, ping_interval=20, ping_timeout=60) as websocket:
+                logger.info(f"Connessione WebSocket stabilita per {len(symbols)} simboli.")
+                async for message in websocket:
+                    await handle_message(message)
         except Exception as e:
-            log(f"[RECONNECT][ERRORE] Errore generale WebSocket: {e}")
-            send_telegram_message(f"[RECONNECT][ERRORE] Errore generale WebSocket: {e}. Riconnessione tra {reconnect_delay}s...")
-        finally:
-            if websocket:
-                await websocket.close()
-            await asyncio.sleep(reconnect_delay)
+            logger.error(f"Errore WebSocket ({len(symbols)} simboli): {e}. Riconnessione tra 5s.")
+            await asyncio.sleep(5)
 
-# Modifica la main per usare la nuova funzione di gestione con riconnessione
-def patch_main_for_reconnect():
-    import types
-    async def main():
-        log(f"[LOG] Connessione al WebSocket Binance: {WS_URL}")
-        process = psutil.Process(os.getpid()) if psutil_available else None
+async def monitor_performance_task():
+    """Task per monitorare e loggare l'uso di CPU/RAM."""
+    p = psutil.Process(os.getpid())
+    while True:
         try:
-            symbols, symbol_info_map = await get_exchange_symbols()
-            if not symbols:
-                log("[LOG][ERRORE] Nessun simbolo ottenuto. Impossibile procedere.")
-                return
-                
-            symbol_groups = [symbols[i:i + SYMBOLS_PER_CONNECTION] 
-                            for i in range(0, len(symbols), SYMBOLS_PER_CONNECTION)]
-            log(f"[LOG] Creazione di {len(symbol_groups)} connessioni WebSocket...")
+            with p.oneshot():
+                cpu = p.cpu_percent()
+                ram_mb = p.memory_info().rss / (1024 * 1024)
+                children = p.children(recursive=True)
+                for child in children:
+                    with child.oneshot():
+                        cpu += child.cpu_percent()
+                        ram_mb += child.memory_info().rss / (1024 * 1024)
             
-            with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-                # Crea task per il controllo arbitraggio e performance
-                arbitrage_task = asyncio.create_task(check_arbitrage(symbol_info_map, executor))
-                
-                tasks_to_run = [arbitrage_task]
-                if process:
-                    monitor_task = asyncio.create_task(monitor_performance(process))
-                    tasks_to_run.append(monitor_task)
-                
-                # Crea e gestisci le connessioni WebSocket con riconnessione
-                websocket_tasks = []
-                for group in symbol_groups:
-                    task = asyncio.create_task(handle_websocket_connection_with_reconnect(group))
-                    websocket_tasks.append(task)
-                
-                all_tasks = websocket_tasks + tasks_to_run
-                    
-                if websocket_tasks:
-                    await asyncio.gather(*all_tasks)
-                else:
-                    log("[LOG][ERRORE] Nessuna connessione WebSocket creata con successo.")
-                    # Assicurati di cancellare i task appesi se le websocket falliscono
-                    for task in tasks_to_run:
-                        task.cancel()
-                
-        except Exception as e:
-            log(f"[LOG][ERRORE] Errore generale: {e}")
-        finally:
-            log("[LOG] Programma terminato.")
-    globals()['main'] = main
-patch_main_for_reconnect()
+            logger.info(f"PERF - CPU: {cpu:.1f}% | RAM: {ram_mb:.2f} MB | Cache Prezzi: {len(prices_cache)}")
+        except psutil.NoSuchProcess:
+            pass # Il processo potrebbe essere terminato
+        await asyncio.sleep(5)
+
+async def hourly_summary_task(bot_start_time):
+    """Invia un riepilogo orario su Telegram."""
+    while True:
+        await asyncio.sleep(3600) # Attende 1 ora
+
+        uptime_seconds = time.time() - bot_start_time
+        days = int(uptime_seconds // (24 * 3600))
+        uptime_seconds %= (24 * 3600)
+        hours = int(uptime_seconds // 3600)
+        uptime_seconds %= 3600
+        minutes = int(uptime_seconds // 60)
+
+        uptime_str = f"{days}g {hours}h {minutes}m"
+
+        summary_message = (
+            f"🕒 *Riepilogo Orario*\n\n"
+            f"✅ *Uptime:* `{uptime_str}`\n"
+            f"💰 *Opportunità Trovate:* `{total_profitable_opportunities_found}`\n"
+            f"🤏 *Quasi Profittevoli (sotto soglia):* `{total_low_profit_positive_found}`"
+        )
+        await send_telegram_notification(summary_message)
+
+async def main():
+    global symbol_info_map
+    getcontext().prec = 15
+    bot_start_time = time.time()
+    
+    logger.info("Avvio programma di arbitraggio triangolare Binance...")
+    await send_telegram_notification("🤖 Avvio del bot di arbitraggio...")
+
+    symbols, symbol_info_map = await get_exchange_symbols()
+    if not symbols:
+        logger.error("Nessun simbolo ottenuto. Impossibile procedere.")
+        return
+
+    symbol_groups = [symbols[i:i + SYMBOLS_PER_CONNECTION] for i in range(0, len(symbols), SYMBOLS_PER_CONNECTION)]
+    
+    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+        websocket_tasks = [websocket_manager(group) for group in symbol_groups]
+        all_tasks = websocket_tasks + [main_loop(executor), monitor_performance_task(), hourly_summary_task(bot_start_time)]
+        await asyncio.gather(*all_tasks)
 
 if __name__ == "__main__":
-    log("[LOG] Avvio programma di arbitraggio triangolare Binance...")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log("[LOG] Programma interrotto manualmente.")
+        logger.info("Programma interrotto manualmente.")
+    except Exception as e:
+        logger.critical(f"Errore critico non gestito in main: {e}", exc_info=True)
