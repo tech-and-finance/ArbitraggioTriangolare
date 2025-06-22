@@ -6,6 +6,54 @@ Questo progetto è un bot avanzato per il rilevamento e l'esecuzione (opzionale)
 
 Il bot è costruito su un'architettura ibrida ad alte prestazioni che sfrutta il meglio della programmazione concorrente in Python per massimizzare l'efficienza e la stabilità.
 
+### Diagramma Architetturale
+
+```mermaid
+graph TD
+    subgraph "Sistema di Arbitraggio"
+        
+        subgraph "Processo Principale (arbitraggio.py)"
+            direction LR
+            A[Loop<br/>asyncio] ==> PP("Process Pool<br/>Executor")
+            A --> WSM("Manager<br/>WebSocket Dati")
+            A --> TN("Notifiche<br/>Telegram")
+            A --> TQ("Coda<br/>Trading")
+        end
+
+        subgraph "Processi Worker (Calcolo intensivo CPU)"
+            W["Worker 1"]
+            W2["Worker 2"]
+            W3["Worker ..."]
+        end
+        
+        subgraph "Processo Trading Dedicato (trading_executor.py)"
+            TE("Esecutore<br/>Trading") --> HT("Trader Ibrido<br/>(WebSocket + REST)")
+        end
+
+    end
+
+    subgraph "Servizi Esterni"
+        direction LR
+        BD["Binance<br/>Market Data API<br/>(WebSocket)"]
+        BT["Binance<br/>Trading API<br/>(WebSocket/REST)"]
+    end
+
+    WSM -- "Riceve dati in tempo reale" --> BD
+    PP -- "Delega calcoli" --> W
+    PP -- "Delega calcoli" --> W2
+    PP -- "Delega calcoli" --> W3
+    
+    W -- "Ritorna<br/>opportunità" --> A
+    W2 -- "Ritorna<br/>opportunità" --> A
+    W3 -- "Ritorna<br/>opportunità" --> A
+    
+    A -- "Se profittevole" --> TN
+    A -- "Se AUTO_TRADE_ENABLED" --> TQ
+
+    TQ -- "Invia ordine da eseguire" --> TE
+    HT -- "Esegue trade" --> BT
+```
+
 ### 1. `asyncio` per l'I/O di Rete
 Il cuore del programma è gestito da `asyncio`. Questo gli permette di gestire in modo estremamente efficiente centinaia di operazioni di Input/Output simultaneamente, come:
 - Mantenere aperte e ricevere dati da multiple connessioni WebSocket con Binance.
