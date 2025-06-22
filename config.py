@@ -22,14 +22,31 @@ TRADE_BUDGET_USDT = Decimal("10")
 # TIMEOUT PER L'ESECUZIONE DEL TRADING (secondi)
 TRADING_TIMEOUT = 30
 
+# Configurazione WebSocket Trading
+WEBSOCKET_TRADING_ENABLED = True  # Abilita trading via WebSocket
+WEBSOCKET_TIMEOUT = 5.0  # Timeout per ordini WebSocket (secondi)
+WEBSOCKET_MAX_FAILURES = 3  # Numero massimo fallimenti prima del fallback
+WEBSOCKET_PING_INTERVAL = 20  # Intervallo ping WebSocket (secondi)
+
+# Configurazione performance
+MAX_EXECUTION_TIME = 10.0  # Tempo massimo di esecuzione per trade (secondi)
+MIN_PROFIT_THRESHOLD = Decimal('0.0005')  # Profitto minimo per notifica/trade (0.05%)
+ARBITRAGE_CHECK_INTERVAL = 5  # Secondi tra i cicli di analisi del mercato
+
 # ============================================================================
-# CONFIGURAZIONE CPU
+# CONFIGURAZIONE SISTEMA E PERFORMANCE
 # ============================================================================
 
-import os
-TOTAL_CORES = os.cpu_count()
-TRADING_CORES = 1
-ANALYSIS_CORES = max(1, TOTAL_CORES - TRADING_CORES)
+# Configurazione CPU e processi
+TOTAL_CORES = 16  # Numero totale di core CPU (impostato manualmente)
+TRADING_CORES = 1  # Core per il trading
+WEB_CORES = 1  # Core per il web server
+ANALYSIS_CORES = 14 # Core per l'analisi (16 - 1 - 1)
+
+# Ottimizzazioni performance per ridurre carico CPU
+MAX_CONCURRENT_ANALYSIS = 2  # Limita analisi concorrenti
+ANALYSIS_BATCH_SIZE = 200  # Dimensione batch per analisi
+PRICE_CACHE_TTL = 5  # TTL cache prezzi (secondi)
 
 # ============================================================================
 # CONFIGURAZIONE BINANCE API
@@ -53,8 +70,17 @@ def get_binance_url():
 # ============================================================================
 
 # File di log per il trading
-TRADING_LOG_FILE = "trading_results.txt"
+TRADING_LOG_FILE = "trading_log.txt"
 TRADING_ERROR_LOG_FILE = "trading_errors.txt"
+
+# ============================================================================
+# CONFIGURAZIONE TELEGRAM
+# ============================================================================
+
+# Configurazione Telegram
+TELEGRAM_BOT_TOKEN = 'YOUR_BOT_TOKEN'
+TELEGRAM_CHAT_ID = 'YOUR_CHAT_ID'
+TELEGRAM_COOLDOWN = 0  # Cooldown tra notifiche (secondi)
 
 # ============================================================================
 # VALIDAZIONE CONFIGURAZIONE
@@ -93,4 +119,10 @@ def print_config_summary():
             for error in errors:
                 print(f"  - {error}")
         else:
-            print("✅ Configurazione valida") 
+            print("✅ Configurazione valida")
+
+# Configurazione Trading
+AUTO_TRADE_ENABLED = False  # Abilita il trading automatico
+DRY_RUN_MODE = True  # Modalità test (usa testnet Binance)
+TRADE_BUDGET_USDT = Decimal('10')  # Budget per trade REALE in USDT
+SIMULATION_BUDGET_USDT = Decimal('22') # Budget per la SIMULAZIONE e i calcoli di esempio 

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import websockets
 from decimal import Decimal, getcontext
 from itertools import permutations
 from datetime import datetime
@@ -11,12 +10,8 @@ from concurrent.futures import ProcessPoolExecutor
 import logging
 from math import ceil
 import concurrent.futures
-import psutil
-try:
-    import psutil
-    psutil_available = True
-except ImportError:
-    psutil_available = False
+
+psutil_available = False # Disabilitato forzatamente
 
 # Importa i nuovi moduli per il trading automatico
 import config
@@ -37,12 +32,8 @@ logger = logging.getLogger(__name__)
 
 # --- Costanti di Configurazione ---
 SYMBOLS_PER_CONNECTION = 200  # Numero di simboli per connessione WebSocket
-PROFIT_THRESHOLD = Decimal("0.001")  # Profitto minimo netto per notifica (0.1%)
 TRADING_FEE = Decimal("0.00075")      # Commissione per ogni trade (0.075% con sconto BNB)
-STARTING_CAPITAL_USDT = Decimal("100") # Capitale iniziale per la simulazione
-ARBITRAGE_CHECK_INTERVAL = 120  # Secondi tra i controlli di arbitraggio (2 minuti)
 STARTING_ASSETS = {'USDT', 'USDC', 'FDUSD', 'DAI', 'TUSD', 'BTC', 'ETH', 'SOL'} # Asset di partenza per l'analisi di arbitraggio
-SIMULATION_CAPITAL = Decimal("100") # Capitale di simulazione in valuta di partenza
 OPPORTUNITY_COOLDOWN = 60  # Secondi prima di notificare di nuovo lo stesso triangolo
 
 # --- File di Log ---
@@ -60,6 +51,8 @@ total_low_profit_positive_found = 0
 # Configurazione Telegram (caricata da variabili d'ambiente o file)
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8182228673:AAEwknPEkwI_vp8froD8rNEquaK88W3EukQ')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '279229754')
+
+BUFFER_SICUREZZA = 0.8  # 80% della quantità disponibile
 
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {msg}")
@@ -132,31 +125,37 @@ def save_profitable_opportunity(opp):
     log(f"[FILE] Opportunità PROFITTEVOLE salvata su {filename}")
 
 async def monitor_performance(process):
-    """Monitora e registra le performance del sistema ogni 5 secondi."""
+    """Monitora e registra le performance del sistema ogni 15 secondi (ridotto da 5)."""
     global msg_count
-    log("[LOG] Avvio monitoraggio performance...")
+    log("[LOG] Avvio monitoraggio performance ottimizzato...")
     while True:
-        await asyncio.sleep(5)
+        await asyncio.sleep(15)  # Aumentato da 5 a 15 secondi per ridurre carico
         
         total_cpu = 0
         total_ram = 0
 
         if psutil_available:
             try:
-                # CPU e RAM del processo principale
-                main_cpu = process.cpu_percent(interval=None)
+                # CPU e RAM del processo principale (semplificato)
+                main_cpu = process.cpu_percent(interval=0.1)  # Intervallo minimo per accuratezza
                 main_ram = process.memory_info().rss / (1024 * 1024)
                 total_cpu += main_cpu
                 total_ram += main_ram
                 
-                # Aggiungi CPU e RAM dei processi figli (il ProcessPoolExecutor)
+                # Monitora solo i processi figli attivi (ridotto carico)
                 children = process.children(recursive=True)
+                active_children = 0
                 for child in children:
                     try:
-                        total_cpu += child.cpu_percent(interval=None)
-                        total_ram += child.memory_info().rss / (1024 * 1024)
+                        if child.status() == psutil.STATUS_RUNNING:
+                            child_cpu = child.cpu_percent(interval=0.1)
+                            child_ram = child.memory_info().rss / (1024 * 1024)
+                            total_cpu += child_cpu
+                            total_ram += child_ram
+                            active_children += 1
                     except psutil.NoSuchProcess:
-                        continue # Il processo potrebbe essere terminato nel frattempo
+                        continue
+                        
             except psutil.NoSuchProcess:
                 log("[PERF][ATTENZIONE] Processo principale non trovato per il monitoraggio.")
                 continue
@@ -169,7 +168,13 @@ async def monitor_performance(process):
         
         msgs = msg_count
         msg_count = 0  # azzera per il prossimo ciclo
-        log(f"[PERF] CPU: {cpu_display} | RAM: {ram_display} | Simboli cache: {len(current_price_map)} | Msg/s: {msgs/5:.0f}")
+        msg_rate = msgs/15  # Calcolato su 15 secondi
+        
+        # Log solo se ci sono attività significative
+        if msgs > 0 or total_cpu > 10:
+            log(f"[PERF] CPU: {cpu_display} | RAM: {ram_display} | Cache: {len(current_price_map)} | Msg/s: {msg_rate:.1f}")
+        else:
+            log(f"[PERF] CPU: {cpu_display} | RAM: {ram_display} | Cache: {len(current_price_map)} | Stato: Idle")
 
 async def get_exchange_symbols():
     """Ottiene i simboli e le loro info, focalizzandosi sulle coppie legate agli asset di partenza."""
@@ -262,7 +267,7 @@ def format_opportunity_message(opp, prices):
         (price_val1, price_val2, price_val3) = prices_details
 
         # --- LOGICA SEMPLIFICATA E CORRETTA ---
-        investimento_usdt = Decimal('100')
+        investimento_usdt = config.SIMULATION_BUDGET_USDT
         guadagno_usdt = investimento_usdt * profit
         finale_usdt = investimento_usdt + guadagno_usdt
         commissioni_usdt = investimento_usdt * (1 - (1 - TRADING_FEE)**3)
@@ -270,7 +275,7 @@ def format_opportunity_message(opp, prices):
         message = f"⚡ *OPPORTUNITÀ DI ARBITRAGGIO*\n\n" \
                     f"🔄 *Percorso:* `{path}`\n" \
                     f"💰 *Profitto Netto Stimato:* `{profit_percentage:.4f}%`\n\n" \
-                    f"💵 *Esempio su 100 USDT:*\n" \
+                    f"💵 *Esempio su {investimento_usdt} USDT:*\n" \
                     f"• Investimento: `{investimento_usdt:.2f} USDT`\n" \
                     f"• Finale Stimato: `{finale_usdt:.4f} USDT`\n" \
                     f"• Guadagno Netto: `{guadagno_usdt:.4f} USDT`\n" \
@@ -300,12 +305,8 @@ def find_arbitrage_worker(prices, symbol_info_map_local, profit_threshold, tradi
         'non_priority_start': 0,
         'low_profit': {'negative': 0, 'positive': 0},
         'simulation_failures': {
-            'total': 0,
-            'FAIL_NO_DATA': 0,
-            'FAIL_STEP_SIZE': 0,
-            'FAIL_MIN_QTY': 0,
-            'FAIL_LIQUIDITY': 0,
-            'FAIL_MIN_NOTIONAL': 0,
+            'total': 0, 'FAIL_NO_DATA': 0, 'FAIL_STEP_SIZE': 0,
+            'FAIL_MIN_QTY': 0, 'FAIL_LIQUIDITY': 0, 'FAIL_MIN_NOTIONAL': 0,
             'UNKNOWN': 0
         }
     }
@@ -313,34 +314,28 @@ def find_arbitrage_worker(prices, symbol_info_map_local, profit_threshold, tradi
     existing_pairs = {c: {} for c in all_currencies}
     for symbol, info in symbol_info_map_local.items():
         base, quote = info['base'], info['quote']
-        if base not in existing_pairs:
-            existing_pairs[base] = {}
+        if base not in existing_pairs: existing_pairs[base] = {}
         existing_pairs[base][quote] = symbol
 
     # Naviga il grafo per trovare solo percorsi validi
     for p_a in currency_chunk:
-        # p_a deve essere nel grafo
         if p_a not in trade_graph: continue
         
-        # Livello 1: p_a -> p_b
         for p_b in trade_graph[p_a]:
-            # Livello 2: p_b -> p_c
             if p_b not in trade_graph: continue
             for p_c in trade_graph[p_b]:
-                # Non vogliamo loop semplici come A->B->A
                 if p_c == p_a: continue
                 
-                # Livello 3: Controlla se p_c può tornare a p_a
                 if p_c in trade_graph and p_a in trade_graph[p_c]:
                     stats['total_triangles'] += 1
                     
-                    # Simula solo percorsi che iniziano con un asset prioritario
                     if p_a not in STARTING_ASSETS:
                         stats['non_priority_start'] += 1
                         continue
 
                     try:
-                        status, result = simulate_trade(p_a, p_b, SIMULATION_CAPITAL, prices, symbol_info_map_local, existing_pairs)
+                        # USA LA VARIABILE DI CONFIG CORRETTA QUI
+                        status, result = simulate_trade(p_a, p_b, config.SIMULATION_BUDGET_USDT, prices, symbol_info_map_local, existing_pairs)
                         if status != 'SUCCESS':
                             stats['simulation_failures']['total'] += 1
                             stats['simulation_failures'][status] = stats['simulation_failures'].get(status, 0) + 1
@@ -366,14 +361,21 @@ def find_arbitrage_worker(prices, symbol_info_map_local, profit_threshold, tradi
                         rate3, amount3, pair3_str = result
                         
                         final_amount = amount3 * (1 - trading_fee)
-                        profit = final_amount - SIMULATION_CAPITAL
+                        profit = final_amount - config.SIMULATION_BUDGET_USDT
                         
-                        if profit > (SIMULATION_CAPITAL * profit_threshold / 100):
-                             profit_perc = (profit / SIMULATION_CAPITAL) * 100
+                        if profit > (config.SIMULATION_BUDGET_USDT * profit_threshold):
+                             profit_perc = (profit / config.SIMULATION_BUDGET_USDT) * 100
                              profitable_opportunities.append({
                                 'path': f"{p_a}→{p_b}→{p_c}→{p_a}",
                                 'profit_perc': f"{profit_perc:.4f}",
-                                'pairs': [pair1_str, pair2_str, pair3_str]
+                                'pairs': [pair1_str, pair2_str, pair3_str],
+                                # Dettagli aggiuntivi per un logging migliore
+                                'details': {
+                                    'rates': (str(rate1), str(rate2), str(rate3)),
+                                    'prices': (str(prices.get(pair1_str,{}).get('ask' if p_a==symbol_info_map_local[pair1_str]['quote'] else 'bid')), 
+                                               str(prices.get(pair2_str,{}).get('ask' if p_b==symbol_info_map_local[pair2_str]['quote'] else 'bid')),
+                                               str(prices.get(pair3_str,{}).get('ask' if p_c==symbol_info_map_local[pair3_str]['quote'] else 'bid')))
+                                }
                             })
                         else:
                             if profit < 0:
@@ -385,7 +387,7 @@ def find_arbitrage_worker(prices, symbol_info_map_local, profit_threshold, tradi
                         stats['simulation_failures']['total'] += 1
                         stats['simulation_failures']['UNKNOWN'] += 1
                         continue
-                        
+    
     return {'profitable': profitable_opportunities, 'stats': stats}
 
 def simulate_trade(start_asset, end_asset, amount_in, prices, symbol_info, existing_pairs):
@@ -459,11 +461,11 @@ async def handle_trading_result(future):
         log(f"❌ Errore gestione risultato trading: {e}")
 
 async def main_loop(analysis_executor, trading_executor):
-    """Ciclo principale che coordina i worker e gestisce i risultati."""
+    """Ciclo principale che coordina i worker e gestisce i risultati (ottimizzato per performance)."""
     global total_profitable_opportunities_found, total_low_profit_positive_found
     
     while True:
-        await asyncio.sleep(5) 
+        await asyncio.sleep(config.ARBITRAGE_CHECK_INTERVAL)  # Usa il valore da config
         if not symbol_info_map:
             logger.info("Mappa dei simboli non ancora pronta, attendo...")
             continue
@@ -476,11 +478,12 @@ async def main_loop(analysis_executor, trading_executor):
         
         all_currencies = sorted(list(set([info['base'] for info in symbol_info_map.values()] + [info['quote'] for info in symbol_info_map.values()])))
         
-        num_workers = analysis_executor._max_workers
+        # Limita il numero di worker per ridurre carico CPU
+        num_workers = min(config.MAX_CONCURRENT_ANALYSIS, analysis_executor._max_workers)
         chunk_size = (len(all_currencies) + num_workers - 1) // num_workers
         currency_chunks = [all_currencies[i:i + chunk_size] for i in range(0, len(all_currencies), chunk_size)]
         
-        # --- Costruzione del Grafo di Trading ---
+        # --- Costruzione del Grafo di Trading (ottimizzata) ---
         trade_graph = {c: [] for c in all_currencies}
         for symbol, info in symbol_info_map.items():
             base, quote = info['base'], info['quote']
@@ -489,7 +492,7 @@ async def main_loop(analysis_executor, trading_executor):
                 trade_graph[quote].append(base)
         # ------------------------------------
 
-        futures = [loop.run_in_executor(analysis_executor, find_arbitrage_worker, current_prices, symbol_info_map, PROFIT_THRESHOLD, TRADING_FEE, chunk, all_currencies, trade_graph) for chunk in currency_chunks]
+        futures = [loop.run_in_executor(analysis_executor, find_arbitrage_worker, current_prices, symbol_info_map, config.MIN_PROFIT_THRESHOLD, TRADING_FEE, chunk, all_currencies, trade_graph) for chunk in currency_chunks]
         
         aggregated_stats = {
             'total_triangles': 0,
@@ -503,74 +506,82 @@ async def main_loop(analysis_executor, trading_executor):
         }
         total_profitable_found = 0
 
-        for future in asyncio.as_completed(futures):
-            try:
-                worker_result = await future
-                opportunities = worker_result.get('profitable', [])
-                worker_stats = worker_result.get('stats', {})
+        # Processa i risultati con timeout per evitare blocchi
+        try:
+            for future in asyncio.as_completed(futures, timeout=30):  # Timeout di 30 secondi
+                try:
+                    worker_result = await future
+                    opportunities = worker_result.get('profitable', [])
+                    worker_stats = worker_result.get('stats', {})
 
-                # Aggrega le statistiche
-                if worker_stats:
-                    aggregated_stats['total_triangles'] += worker_stats.get('total_triangles', 0)
-                    aggregated_stats['non_priority_start'] += worker_stats.get('non_priority_start', 0)
+                    # Aggrega le statistiche
+                    if worker_stats:
+                        aggregated_stats['total_triangles'] += worker_stats.get('total_triangles', 0)
+                        aggregated_stats['non_priority_start'] += worker_stats.get('non_priority_start', 0)
+                        
+                        # Aggrega low_profit
+                        low_profit_stats = worker_stats.get('low_profit', {})
+                        aggregated_stats['low_profit']['negative'] += low_profit_stats.get('negative', 0)
+                        aggregated_stats['low_profit']['positive'] += low_profit_stats.get('positive', 0)
+
+                        # Aggrega simulation_failures
+                        sim_fail_stats = worker_stats.get('simulation_failures', {})
+                        for key, value in sim_fail_stats.items():
+                            aggregated_stats['simulation_failures'][key] += value
+
+                    if not opportunities: continue
                     
-                    # Aggrega low_profit
-                    low_profit_stats = worker_stats.get('low_profit', {})
-                    aggregated_stats['low_profit']['negative'] += low_profit_stats.get('negative', 0)
-                    aggregated_stats['low_profit']['positive'] += low_profit_stats.get('positive', 0)
+                    total_profitable_found += len(opportunities)
 
-                    # Aggrega simulation_failures
-                    sim_fail_stats = worker_stats.get('simulation_failures', {})
-                    for key, value in sim_fail_stats.items():
-                        aggregated_stats['simulation_failures'][key] += value
+                    for opp in opportunities:
+                        path, profit_perc_str = opp.get('path'), opp.get('profit_perc')
+                        if not path: continue
+                        
+                        triangle_key = tuple(sorted(path.split('→')[:3]))
+                        current_time = time.time()
+                        
+                        if (current_time - profitable_opportunities_set.get(triangle_key, 0)) > OPPORTUNITY_COOLDOWN:
+                            profitable_opportunities_set[triangle_key] = current_time
+                            total_profitable_opportunities_found += 1 # Incrementa il contatore globale
 
-                if not opportunities: continue
-                
-                total_profitable_found += len(opportunities)
+                            # --- LOG E FILE: SEMPRE PRIMA DI NOTIFICA ---
+                            profit_perc_val = float(profit_perc_str)
+                            guadagno_stimato = config.SIMULATION_BUDGET_USDT * (profit_perc_val / 100)
+                            # Calcolo importo ottimale e volumi
+                            try:
+                                importo_ottimale, volumi = calcola_importo_ottimale_con_buffer(opp['pairs'], current_prices, symbol_info_map)
+                            except Exception as e:
+                                importo_ottimale, volumi = 0, []
+                                logger.error(f"Errore calcolo importo ottimale: {e}")
+                            log_line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} | {path} | Profitto Netto: {profit_perc_val:.4f}% | Guadagno Stimato ({config.SIMULATION_BUDGET_USDT} USDT): {guadagno_stimato:.4f} USDT\n"
+                            log_line += f"Importo ottimale investibile (buffer {int(BUFFER_SICUREZZA*100)}%): {importo_ottimale:.4f} USDT\n"
+                            for v in volumi:
+                                log_line += f"  - {v['pair']} {v['side']}_qty: {v['qty']:.4f}\n"
+                            file_to_write = ANOMALIES_FILE if profit_perc_val > 50.0 else PROFITS_FILE
+                            try:
+                                with open(file_to_write, "a", encoding="utf-8") as f:
+                                    f.write(log_line if profit_perc_val <= 50.0 else f"[ANOMALIA] {log_line}")
+                            except Exception as e:
+                                logger.error(f"Errore scrittura file opportunità: {e}")
+                            # Logga sempre anche nel file delle profittevoli se sopra soglia
+                            if profit_perc_val >= float(config.MIN_PROFIT_THRESHOLD) * 100:
+                                try:
+                                    save_profitable_opportunity(opp)
+                                except Exception as e:
+                                    logger.error(f"Errore scrittura file profittevoli: {e}")
 
-                for opp in opportunities:
-                    path, profit_perc_str = opp.get('path'), opp.get('profit_perc')
-                    if not path: continue
+                            # --- NOTIFICA TELEGRAM ROBUSTA ---
+                            try:
+                                msg = format_opportunity_message(opp, current_prices)
+                                await send_telegram_notification(msg)
+                            except Exception as e:
+                                logger.error(f"Errore nella formattazione o invio Telegram per {path}: {e}\nDati: {opp}")
+
+                except Exception as e:
+                    logger.error(f"Errore nel processare il risultato del worker: {e}")
                     
-                    triangle_key = tuple(sorted(path.split('→')[:3]))
-                    current_time = time.time()
-                    
-                    if (current_time - profitable_opportunities_set.get(triangle_key, 0)) > OPPORTUNITY_COOLDOWN:
-                        profitable_opportunities_set[triangle_key] = current_time
-                        total_profitable_opportunities_found += 1 # Incrementa il contatore globale
-                        
-                        await send_telegram_notification(format_opportunity_message(opp, current_prices))
-                        
-                        profit_perc_val = float(profit_perc_str)
-                        guadagno_stimato = 100 * (profit_perc_val / 100)
-                        log_line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} | {path} | Profitto Netto: {profit_perc_val:.4f}% | Guadagno Stimato (100 USDT): {guadagno_stimato:.4f} USDT\n"
-                        
-                        file_to_write = ANOMALIES_FILE if profit_perc_val > 50.0 else PROFITS_FILE
-                        with open(file_to_write, "a", encoding="utf-8") as f:
-                            f.write(log_line if profit_perc_val <= 50.0 else f"[ANOMALIA] {log_line}")
-                        
-                        # --- ESECUZIONE TRADING AUTOMATICO ---
-                        if config.AUTO_TRADE_ENABLED:
-                            # Prepara i dati per il trading
-                            trading_data = {
-                                'path': path,
-                                'pairs': opp.get('pairs', []),
-                                'prices': current_prices,
-                                'timestamp': time.time()
-                            }
-                            
-                            # Esegue in processo separato su core dedicato
-                            future = loop.run_in_executor(
-                                trading_executor,
-                                trading_worker_with_affinity,
-                                trading_data
-                            )
-                            
-                            # Gestisce il risultato
-                            asyncio.create_task(handle_trading_result(future))
-
-            except Exception as e:
-                logger.error(f"Errore nel processare il risultato del worker: {e}")
+        except asyncio.TimeoutError:
+            logger.warning("⚠️ Timeout nell'analisi dei worker (30s)")
         
         # Aggiorna il contatore globale dei quasi-profittevoli
         total_low_profit_positive_found += aggregated_stats['low_profit']['positive']
@@ -579,28 +590,39 @@ async def main_loop(analysis_executor, trading_executor):
         total_low_profit = aggregated_stats['low_profit']['negative'] + aggregated_stats['low_profit']['positive']
         total_sim_failures = aggregated_stats['simulation_failures']['total']
 
-        logger.info("--- Statistiche Ciclo di Analisi ---")
-        logger.info(f"Durata Analisi: {duration_ms:.2f} ms")
-        logger.info(f"Triangoli validi trovati: {aggregated_stats['total_triangles']:,}")
-        logger.info(f"  - Scartati (partenza non prioritaria): {aggregated_stats['non_priority_start']:,}")
-        logger.info(f"  - Scartati (fallimento simulazione): {total_sim_failures:,}")
+        # Log completo ma con frequenza ridotta per performance
+        should_log_detailed = (
+            total_profitable_found > 0 or 
+            duration_ms > 5000 or 
+            aggregated_stats['total_triangles'] > 10000  # Log se molti triangoli
+        )
         
-        if total_sim_failures > 0:
-            sim_failures = aggregated_stats['simulation_failures']
-            logger.info(f"    - Liquidità insufficiente: {sim_failures.get('FAIL_LIQUIDITY', 0):,}")
-            logger.info(f"    - Valore nozionale minimo: {sim_failures.get('FAIL_MIN_NOTIONAL', 0):,}")
-            logger.info(f"    - Quantità minima non raggiunta: {sim_failures.get('FAIL_MIN_QTY', 0):,}")
-            logger.info(f"    - Quantità zero per stepSize: {sim_failures.get('FAIL_STEP_SIZE', 0):,}")
-            logger.info(f"    - Dati/Prezzo mancanti: {sim_failures.get('FAIL_NO_DATA', 0):,}")
-            if sim_failures.get('UNKNOWN', 0) > 0:
-                 logger.info(f"    - Sconosciuto/Altro: {sim_failures.get('UNKNOWN', 0):,}")
+        if should_log_detailed:
+            logger.info("--- Statistiche Ciclo di Analisi ---")
+            logger.info(f"Durata Analisi: {duration_ms:.2f} ms")
+            logger.info(f"Triangoli validi trovati: {aggregated_stats['total_triangles']:,}")
+            logger.info(f"  - Scartati (partenza non prioritaria): {aggregated_stats['non_priority_start']:,}")
+            logger.info(f"  - Scartati (fallimento simulazione): {total_sim_failures:,}")
+            
+            if total_sim_failures > 0:
+                sim_failures = aggregated_stats['simulation_failures']
+                logger.info(f"    - Liquidità insufficiente: {sim_failures.get('FAIL_LIQUIDITY', 0):,}")
+                logger.info(f"    - Valore nozionale minimo: {sim_failures.get('FAIL_MIN_NOTIONAL', 0):,}")
+                logger.info(f"    - Quantità minima non raggiunta: {sim_failures.get('FAIL_MIN_QTY', 0):,}")
+                logger.info(f"    - Quantità zero per stepSize: {sim_failures.get('FAIL_STEP_SIZE', 0):,}")
+                logger.info(f"    - Dati/Prezzo mancanti: {sim_failures.get('FAIL_NO_DATA', 0):,}")
+                if sim_failures.get('UNKNOWN', 0) > 0:
+                     logger.info(f"    - Sconosciuto/Altro: {sim_failures.get('UNKNOWN', 0):,}")
 
-        logger.info(f"  - Scartati (profitto troppo basso): {total_low_profit:,}")
-        if total_low_profit > 0:
-            logger.info(f"    - Negativo (perdita): {aggregated_stats['low_profit']['negative']:,}")
-            logger.info(f"    - Positivo (sotto soglia): {aggregated_stats['low_profit']['positive']:,}")
-        logger.info(f"Opportunità Profittevoli Trovate: {total_profitable_found}")
-        logger.info("------------------------------------")
+            logger.info(f"  - Scartati (profitto troppo basso): {total_low_profit:,}")
+            if total_low_profit > 0:
+                logger.info(f"    - Negativo (perdita): {aggregated_stats['low_profit']['negative']:,}")
+                logger.info(f"    - Positivo (sotto soglia): {aggregated_stats['low_profit']['positive']:,}")
+            logger.info(f"Opportunità Profittevoli Trovate: {total_profitable_found}")
+            logger.info("------------------------------------")
+        else:
+            # Log sintetico per cicli normali
+            logger.info(f"Analisi completata: {duration_ms:.1f}ms | Triangoli: {aggregated_stats['total_triangles']:,} | Opportunità: {total_profitable_found}")
 
 async def send_telegram_notification(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
@@ -614,36 +636,33 @@ async def send_telegram_notification(message):
         logger.error(f"Eccezione invio Telegram: {e}")
 
 async def websocket_manager(symbols):
-    """Gestisce una singola connessione WebSocket con riconnessione."""
+    """Gestisce una singola connessione WebSocket con riconnessione e ottimizzazioni."""
     url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(symbols)}"
+    reconnect_delay = 5
+    max_reconnect_delay = 60
+    
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=60) as websocket:
+            # Importa websockets solo quando necessario
+            import websockets
+            
+            async with websockets.connect(
+                url, 
+                ping_interval=30,  # Aumentato da 20 a 30
+                ping_timeout=60,
+                close_timeout=10,
+                max_size=2**20  # Limita dimensione messaggi
+            ) as websocket:
                 logger.info(f"Connessione WebSocket stabilita per {len(symbols)} simboli.")
+                reconnect_delay = 5  # Reset delay su successo
+                
                 async for message in websocket:
                     await handle_message(message)
+                    
         except Exception as e:
-            logger.error(f"Errore WebSocket ({len(symbols)} simboli): {e}. Riconnessione tra 5s.")
-            await asyncio.sleep(5)
-
-async def monitor_performance_task():
-    """Task per monitorare e loggare l'uso di CPU/RAM."""
-    p = psutil.Process(os.getpid())
-    while True:
-        try:
-            with p.oneshot():
-                cpu = p.cpu_percent()
-                ram_mb = p.memory_info().rss / (1024 * 1024)
-                children = p.children(recursive=True)
-                for child in children:
-                    with child.oneshot():
-                        cpu += child.cpu_percent()
-                        ram_mb += child.memory_info().rss / (1024 * 1024)
-            
-            logger.info(f"PERF - CPU: {cpu:.1f}% | RAM: {ram_mb:.2f} MB | Cache Prezzi: {len(prices_cache)}")
-        except psutil.NoSuchProcess:
-            pass # Il processo potrebbe essere terminato
-        await asyncio.sleep(5)
+            logger.error(f"Errore WebSocket ({len(symbols)} simboli): {e}. Riconnessione tra {reconnect_delay}s.")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)  # Backoff esponenziale
 
 async def hourly_summary_task(bot_start_time):
     """Invia un riepilogo orario su Telegram."""
@@ -666,6 +685,49 @@ async def hourly_summary_task(bot_start_time):
             f"🤏 *Quasi Profittevoli (sotto soglia):* `{total_low_profit_positive_found}`"
         )
         await send_telegram_notification(summary_message)
+
+def calcola_importo_ottimale_con_buffer(pairs, prices, symbol_info_map):
+    """
+    Calcola l'importo massimo investibile per un triangolo usando solo il best bid/ask e applicando un buffer di sicurezza.
+    Restituisce l'importo ottimale e i volumi disponibili per ogni step.
+    """
+    importo_massimi = []
+    volumi = []
+    for i, pair in enumerate(pairs):
+        info = symbol_info_map.get(pair)
+        book = prices.get(pair)
+        if not info or not book:
+            importo_massimi.append(0)
+            volumi.append({'pair': pair, 'qty': 0, 'side': 'N/A'})
+            continue
+        if i == 0:
+            # Primo step: BUY (usiamo ask)
+            qty_disp = book['ask_qty'] * BUFFER_SICUREZZA
+            prezzo = book['ask']
+            min_qty = info['minQty']
+            min_notional = info['minNotional']
+            step = info['stepSize']
+            max_qty = max(min(qty_disp, qty_disp // step * step), 0)
+            max_notional = max_qty * prezzo
+            if max_qty < min_qty or max_notional < min_notional:
+                max_qty = 0
+            importo_massimi.append(max_qty * prezzo)
+            volumi.append({'pair': pair, 'qty': qty_disp, 'side': 'ask'})
+        else:
+            # Secondo e terzo step: SELL (usiamo bid)
+            qty_disp = book['bid_qty'] * BUFFER_SICUREZZA
+            prezzo = book['bid']
+            min_qty = info['minQty']
+            min_notional = info['minNotional']
+            step = info['stepSize']
+            max_qty = max(min(qty_disp, qty_disp // step * step), 0)
+            max_notional = max_qty * prezzo
+            if max_qty < min_qty or max_notional < min_notional:
+                max_qty = 0
+            importo_massimi.append(max_qty * prezzo)
+            volumi.append({'pair': pair, 'qty': qty_disp, 'side': 'bid'})
+    importo_ottimale = min(importo_massimi)
+    return importo_ottimale, volumi
 
 async def main():
     global symbol_info_map
@@ -701,8 +763,7 @@ async def main():
         with ProcessPoolExecutor(max_workers=config.TRADING_CORES) as trading_executor:
             websocket_tasks = [websocket_manager(group) for group in symbol_groups]
             all_tasks = websocket_tasks + [
-                main_loop(analysis_executor, trading_executor), 
-                monitor_performance_task(), 
+                main_loop(analysis_executor, trading_executor),
                 hourly_summary_task(bot_start_time)
             ]
             await asyncio.gather(*all_tasks)
