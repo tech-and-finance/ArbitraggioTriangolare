@@ -1,70 +1,64 @@
 # Bot di Arbitraggio Triangolare per Binance
 
-Questo progetto è un bot avanzato per il rilevamento di opportunità di arbitraggio triangolare sull'exchange di criptovalute Binance. Il bot si connette in tempo reale ai flussi di dati di mercato, calcola migliaia di potenziali percorsi di arbitraggio al secondo e implementa una serie di filtri strategici e tecnici per identificare solo le opportunità realistiche e potenzialmente eseguibili.
+Questo progetto è un bot avanzato per il rilevamento e l'esecuzione (opzionale) di opportunità di arbitraggio triangolare sull'exchange di criptovalute Binance. Il bot si connette in tempo reale ai flussi di dati di mercato, calcola migliaia di potenziali percorsi di arbitraggio al secondo e implementa una serie di filtri strategici e tecnici per identificare e, se abilitato, eseguire solo le opportunità realistiche.
 
 ## Architettura e Design
 
 Il bot è costruito su un'architettura ibrida ad alte prestazioni che sfrutta il meglio della programmazione concorrente in Python per massimizzare l'efficienza e la stabilità.
 
 ### 1. `asyncio` per l'I/O di Rete
-Il thread principale del programma è gestito da `asyncio`. Questo gli permette di gestire in modo estremamente efficiente centinaia di operazioni di Input/Output simultaneamente, come:
+Il cuore del programma è gestito da `asyncio`. Questo gli permette di gestire in modo estremamente efficiente centinaia di operazioni di Input/Output simultaneamente, come:
 - Mantenere aperte e ricevere dati da multiple connessioni WebSocket con Binance.
-- Scrivere in modo non bloccante su diversi file di log.
 - Inviare notifiche all'API di Telegram senza "congelare" il resto del programma.
-- Gestire task periodici come il monitoraggio delle performance e i riepiloghi orari.
+- Eseguire il trading ultra-veloce tramite una connessione WebSocket dedicata.
+- Gestire task periodici come i riepiloghi orari.
 
 ### 2. `ProcessPoolExecutor` per i Calcoli Intensivi
-Il calcolo delle opportunità di arbitraggio è un'operazione che richiede un uso intensivo della CPU. Se fosse eseguita nel thread principale di `asyncio`, bloccherebbe l'intero programma, causando la disconnessione dai WebSocket. Per evitare ciò, questi calcoli vengono delegati a un pool di processi separati. Questo permette al bot di sfruttare tutti i core della CPU per i calcoli pesanti, mentre il thread principale rimane libero e reattivo per gestire la rete.
+L'analisi delle opportunità di arbitraggio è un'operazione che richiede un uso intensivo della CPU. Per non bloccare il loop di `asyncio`, questi calcoli vengono delegati a un **pool di processi separati**. Questo permette al bot di sfruttare tutti i core della CPU per i calcoli pesanti, mentre il thread principale rimane libero e reattivo per gestire la rete e il trading.
 
 ### 3. Approccio a Grafo per l'Efficienza
-A differenza di un approccio a forza bruta che controlla ogni possibile combinazione di tre valute, questo bot implementa una logica molto più intelligente basata sulla **teoria dei grafi**:
-1.  **Costruzione del Grafo:** All'inizio di ogni ciclo di analisi, il bot costruisce una "mappa" delle connessioni dirette, dove ogni valuta è un nodo e ogni coppia di trading esistente è un arco.
-2.  **Navigazione Efficiente:** I processi worker non generano più permutazioni casuali. Invece, navigano il grafo pre-calcolato, esplorando **solo ed esclusivamente percorsi di trading a 3 passi che esistono realmente**.
-
-Questo approccio elimina milioni di calcoli inutili per ogni ciclo, riducendo drasticamente il numero di "percorsi non validi" e concentrando la potenza della CPU solo sull'analisi di opportunità concrete.
+A differenza di un approccio a forza bruta, questo bot implementa una logica molto più intelligente basata sulla **teoria dei grafi**:
+1.  **Costruzione del Grafo:** All'inizio di ogni ciclo, il bot costruisce una "mappa" delle connessioni dirette (coppie di trading) tra tutte le valute.
+2.  **Navigazione Efficiente:** I processi worker esplorano **solo ed esclusivamente percorsi di trading a 3 passi che esistono realmente sul mercato**, eliminando milioni di calcoli inutili e concentrando la potenza della CPU solo sull'analisi di opportunità concrete.
 
 ## Funzionalità e Filtri
 
-L'efficacia del bot risiede nella sua capacità di scartare il "rumore" di mercato. Per questo, sono stati implementati diversi livelli di filtro.
+L'efficacia del bot risiede nella sua capacità di scartare il "rumore" di mercato e identificare operazioni valide.
 
 ### Filtri Tecnici di Simulazione
-Ogni percorso valido viene sottoposto a una simulazione realistica che deve superare tutti i seguenti controlli per ogni "gamba" del triangolo:
-- **Liquidità:** La quantità richiesta per il trade deve essere disponibile sull'order book.
-- **`minQty`:** La quantità scambiata deve essere superiore alla soglia minima richiesta da Binance per quella coppia.
-- **`minNotional`:** Il valore totale del trade (quantità x prezzo) deve superare il valore nozionale minimo richiesto (solitamente intorno ai 10$).
-- **`stepSize`:** La quantità scambiata viene arrotondata per difetto per rispettare la precisione decimale richiesta da Binance per quella coppia. Se la quantità arrotondata è zero, il trade viene scartato.
+Ogni potenziale triangolo viene sottoposto a una simulazione realistica che deve superare i seguenti controlli per ogni "gamba" del percorso:
+- **Liquidità:** La quantità richiesta per il trade deve essere disponibile sull'order book al miglior prezzo (best bid/ask).
+- **`minQty`:** La quantità scambiata deve essere superiore alla soglia minima richiesta da Binance.
+- **`minNotional`:** Il valore totale del trade (quantità x prezzo) deve superare il valore nozionale minimo.
+- **`stepSize`:** La quantità scambiata viene arrotondata per difetto per rispettare la precisione decimale richiesta.
 
-### Filtri Strategici
-- **Asset di Partenza Prioritari:** Per massimizzare la praticità e concentrare l'analisi, la strategia principale considera solo i percorsi di arbitraggio che iniziano e finiscono con uno degli asset definiti come prioritari (es. `USDT`, `BTC`, `ETH`, `SOL`, ecc.).
-- **Cooldown delle Opportunità:** Per evitare notifiche ripetute per la stessa opportunità volatile, una volta che un triangolo viene notificato, non verrà segnalato di nuovo per un periodo di tempo configurabile (`OPPORTUNITY_COOLDOWN`).
+### Analisi dell'Importo Ottimale
+Per ogni opportunità profittevole identificata, il bot esegue un'analisi aggiuntiva per determinare l'**importo massimo investibile** in modo sicuro.
+- **Calcolo:** Viene calcolata la quantità massima eseguibile per ogni step del triangolo, considerando la liquidità disponibile al primo livello dell'order book.
+- **Buffer di Sicurezza:** Per evitare lo slippage, viene applicato un buffer conservativo (es. 80%) sulla quantità disponibile.
+- **Logging:** L'importo ottimale calcolato e i volumi disponibili per ogni coppia vengono salvati nel file di log, fornendo dati cruciali per valutare la reale fattibilità dell'opportunità.
 
-## Sistema di Notifiche
-Il bot utilizza Telegram per fornire aggiornamenti in tempo reale:
-- **Notifiche di Opportunità:** Invio immediato di un messaggio quando viene trovata un'opportunità che supera tutti i filtri. Il sistema è stato ottimizzato per inviare una notifica per ogni singola opportunità, dato che il bot è ora sufficientemente selettivo da non causare "spam".
-- **Riepilogo Orario:** Ogni ora, il bot invia un messaggio di riepilogo contenente:
-  - L'uptime totale del bot.
-  - Il numero totale di opportunità profittevoli trovate dall'avvio.
-  - Il numero totale di opportunità "quasi profittevoli" (con profitto positivo ma inferiore alla soglia).
-- **Notifiche di Stato:** Messaggi di avvio e di errore critico per monitorare la salute del bot.
+## Trading Automatico (Ibrido WebSocket/REST)
+
+Il bot include un modulo opzionale per l'esecuzione automatica dei trade, progettato per la massima velocità e sicurezza.
+
+- **Modalità Ibrida:** Utilizza primariamente una connessione **WebSocket per piazzare ordini**, riducendo drasticamente la latenza rispetto alle tradizionali API REST. In caso di fallimento della connessione WebSocket, il sistema esegue automaticamente un **fallback all'API REST** per garantire l'esecuzione.
+- **Processo Dedicato:** L'esecuzione del trading avviene in un processo completamente separato con affinità impostata su un core della CPU dedicato, per non essere influenzato o rallentato dall'analisi del mercato.
+- **Sicurezza:**
+  - Il trading automatico è **disabilitato di default** e deve essere attivato esplicitamente nel file di configurazione.
+  - È presente una modalità **Dry Run (Testnet)** che permette di testare l'intera logica di trading sulla testnet di Binance senza usare fondi reali.
+  - In caso di fallimento di un'operazione intermedia, una funzione di **liquidazione d'emergenza** tenta di rivendere immediatamente gli asset acquistati per riportare il capitale alla valuta di partenza.
+
+## Configurazione Centralizzata
+
+Tutte le impostazioni chiave del bot sono state centralizzate nel file `config.py` per una gestione semplice e sicura. Questo include:
+- Abilitazione del trading automatico e della modalità testnet.
+- Credenziali API di Binance e Telegram.
+- Parametri di performance come la soglia di profitto, il budget di simulazione e l'intervallo tra i cicli di analisi.
+- Allocazione dei core della CPU per i processi di analisi e trading.
 
 ## Statistiche e Logging
-Per la massima trasparenza, il bot fornisce un riepilogo statistico dettagliato alla fine di ogni ciclo di analisi. Questo report, stampato direttamente nella console, è fondamentale per comprendere il comportamento del mercato e l'efficacia dei filtri.
-
-- **Durata Analisi:** Il tempo totale impiegato per il ciclo di calcolo, tipicamente nell'ordine di poche centinaia di millisecondi.
-- **Triangoli Validi Trovati:** Il numero di percorsi a 3 passi realmente esistenti sul mercato.
-- **Scarti per Strategia:** Quanti percorsi sono stati ignorati perché non partivano da un asset prioritario.
-- **Scarti per Fallimento Simulazione:** Il totale dei percorsi scartati durante la simulazione, con un **breakdown dettagliato** per ogni motivo specifico del fallimento:
-    - `Liquidità insufficiente`
-    - `Valore nozionale minimo non raggiunto`
-    - `Quantità minima non raggiunta`
-    - `Quantità arrotondata a zero (stepSize)`
-    - `Dati di mercato o prezzo mancanti`
-- **Scarti per Profitto Troppo Basso:** Il totale dei percorsi simulati con successo ma non profittevoli, con un **breakdown** tra perdite nette e profitti positivi ma inferiori alla soglia impostata.
-- **Opportunità Profittevoli Trovate:** Il numero di opportunità che hanno superato tutti i filtri nel ciclo corrente.
-
-I log delle opportunità vengono salvati in due file, con codifica **UTF-8** per la massima compatibilità:
-- `profitable_opportunities.txt`: Contiene solo le opportunità che hanno superato tutti i filtri.
-- `anomalies.txt`: Contiene le rare opportunità con profitti irrealisticamente alti (es. >50%) per analisi successive.
+Per la massima trasparenza, il bot fornisce un riepilogo statistico dettagliato alla fine di ogni ciclo di analisi. I log delle opportunità vengono salvati in `profitable_opportunities.txt` con codifica UTF-8.
 
 ## Installazione e Avvio
 
@@ -92,8 +86,8 @@ I log delle opportunità vengono salvati in due file, con codifica **UTF-8** per
     pip install -r requirements.txt
     ```
 
-4.  **Configurare le Credenziali (Opzionale)**
-    Il token del bot Telegram e il chat ID sono già inseriti nel codice. Per una maggiore sicurezza, è consigliabile impostarli come variabili d'ambiente (`TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID`).
+4.  **Configurare `config.py`**
+    Apri il file `config.py` e inserisci le tue credenziali API (se vuoi abilitare il trading) e i parametri desiderati.
 
 5.  **Avviare il Bot**
     ```bash
@@ -101,4 +95,4 @@ I log delle opportunità vengono salvati in due file, con codifica **UTF-8** per
     ```
 
 ---
-*Disclaimer: Questo strumento è fornito a scopo educativo e sperimentale. L'arbitraggio di criptovalute comporta rischi significativi. L'autore non si assume alcuna responsabilità per eventuali perdite finanziarie. Usare a proprio rischio.* 
+*Disclaimer: Questo strumento è fornito a scopo educativo e sperimentale. Il trading di criptovalute comporta rischi significativi. L'autore non si assume alcuna responsabilità per eventuali perdite finanziarie. Usare a proprio rischio.* 
