@@ -48,7 +48,10 @@ ANALYSIS_CORES = 14 # Core per l'analisi (16 - 1 - 1)
 
 # Ottimizzazioni performance per ridurre carico CPU
 # Override via env var per benchmark/tuning runtime senza redeploy.
-MAX_CONCURRENT_ANALYSIS = int(os.environ.get('MAX_CONCURRENT_ANALYSIS_OVERRIDE', '14'))
+# Benchmark 2026-05-05 ha mostrato 4 worker = sweet spot (avg 90ms/ciclo).
+# 8 worker +28%, 14 worker +75% per overhead IPC (pickle symbol_info_map per worker call).
+# Vedi Vault/Projects/arbitraggio-triangolare-deep-analysis-2026-05-05.md § Benchmark parallelismo.
+MAX_CONCURRENT_ANALYSIS = int(os.environ.get('MAX_CONCURRENT_ANALYSIS_OVERRIDE', '4'))
 ANALYSIS_BATCH_SIZE = 200  # Dimensione batch per analisi
 PRICE_CACHE_TTL = 5  # TTL cache prezzi (secondi)
 
