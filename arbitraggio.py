@@ -4,6 +4,7 @@ from decimal import Decimal, getcontext
 from itertools import permutations
 from datetime import datetime
 import requests
+import aiohttp
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -57,7 +58,7 @@ BUFFER_SICUREZZA = 0.8  # 80% della quantità disponibile
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {msg}")
 
-getcontext().prec = 12
+getcontext().prec = 28  # H1 fix: era 12 ma main() risettava 15 e worker process default 28 → incoerenza
 
 # URL WebSocket Binance
 WS_URL = "wss://stream.binance.com:9443/stream"
@@ -297,8 +298,40 @@ def adjust_quantity_for_step_size(quantity, step_size):
         return (quantity // step_size) * step_size
     return quantity
 
+def get_budget_in_asset(start_asset, budget_usdt, prices, existing_pairs):
+    """C2 fix: converte il budget USDT in unità del start_asset usando prezzi correnti.
+
+    Risolve il bug di unit-mismatch: la simulazione partiva sempre con
+    SIMULATION_BUDGET_USDT (es. 22 USDT) come quantità di start_asset, anche
+    quando start_asset era BTC/ETH/SOL. Risultato: profit calcolato come
+    differenza di unità diverse, falsi negativi sistemici.
+
+    Ritorna None se non c'è modo di pricare l'asset in USDT/USDC/FDUSD.
+    """
+    if start_asset == 'USDT':
+        return budget_usdt
+    # Direzione 1: pair <start_asset>/<stable> dove start è base.
+    # Prezzo bid = quanto stable ricevi per 1 start_asset → budget_usdt / bid = unità start.
+    for stable in ('USDT', 'USDC', 'FDUSD'):
+        if start_asset in existing_pairs and stable in existing_pairs[start_asset]:
+            symbol = existing_pairs[start_asset][stable]
+            book = prices.get(symbol)
+            if book and book.get('bid') and book['bid'] > 0:
+                return budget_usdt / book['bid']
+    # Direzione 2 (raro): pair <stable>/<start_asset> dove start è quote.
+    # Prezzo ask = quanto stable serve per 1 unità di altro asset → budget_usdt / ask = unità start.
+    for stable in ('USDT', 'USDC', 'FDUSD'):
+        if stable in existing_pairs and start_asset in existing_pairs[stable]:
+            symbol = existing_pairs[stable][start_asset]
+            book = prices.get(symbol)
+            if book and book.get('ask') and book['ask'] > 0:
+                return budget_usdt / book['ask']
+    return None
+
 def find_arbitrage_worker(prices, symbol_info_map_local, profit_threshold, trading_fee, currency_chunk, all_currencies, trade_graph):
     """Processo worker che cerca opportunità di arbitraggio navigando un grafo pre-calcolato."""
+    # H1 fix: garantisce prec=28 anche nei worker process (per chiarezza esplicita).
+    getcontext().prec = 28
     worker_pid = os.getpid()
     print(f"[WORKER][{worker_pid}] Avvio analisi per {len(currency_chunk)} valute")
     
@@ -306,6 +339,7 @@ def find_arbitrage_worker(prices, symbol_info_map_local, profit_threshold, tradi
     stats = {
         'total_triangles': 0,
         'non_priority_start': 0,
+        'cannot_convert_budget': 0,
         'low_profit': {'negative': 0, 'positive': 0},
         'simulation_failures': {
             'total': 0, 'FAIL_NO_DATA': 0, 'FAIL_STEP_SIZE': 0,
@@ -337,8 +371,14 @@ def find_arbitrage_worker(prices, symbol_info_map_local, profit_threshold, tradi
                         continue
 
                     try:
-                        # USA LA VARIABILE DI CONFIG CORRETTA QUI
-                        status, result = simulate_trade(p_a, p_b, config.SIMULATION_BUDGET_USDT, prices, symbol_info_map_local, existing_pairs)
+                        # C2 fix: converti il budget USDT in unità del start_asset usando prezzi correnti.
+                        # Prima si passava sempre 22 USDT come "quantità" di start_asset, sbagliato per BTC/ETH/SOL.
+                        budget_in_asset = get_budget_in_asset(p_a, config.SIMULATION_BUDGET_USDT, prices, existing_pairs)
+                        if budget_in_asset is None or budget_in_asset <= 0:
+                            stats['cannot_convert_budget'] += 1
+                            continue
+
+                        status, result = simulate_trade(p_a, p_b, budget_in_asset, prices, symbol_info_map_local, existing_pairs)
                         if status != 'SUCCESS':
                             stats['simulation_failures']['total'] += 1
                             stats['simulation_failures'][status] = stats['simulation_failures'].get(status, 0) + 1
@@ -362,12 +402,13 @@ def find_arbitrage_worker(prices, symbol_info_map_local, profit_threshold, tradi
                             stats['simulation_failures'][status] = stats['simulation_failures'].get(status, 0) + 1
                             continue
                         rate3, amount3, pair3_str = result
-                        
+
                         final_amount = amount3 * (1 - trading_fee)
-                        profit = final_amount - config.SIMULATION_BUDGET_USDT
-                        
-                        if profit > (config.SIMULATION_BUDGET_USDT * profit_threshold):
-                             profit_perc = (profit / config.SIMULATION_BUDGET_USDT) * 100
+                        # Profit ratio dimensionless = (final - budget) / budget. Confrontabile direttamente con threshold.
+                        profit_ratio = (final_amount - budget_in_asset) / budget_in_asset
+
+                        if profit_ratio > profit_threshold:
+                             profit_perc = profit_ratio * 100
                              profitable_opportunities.append({
                                 'path': f"{p_a}→{p_b}→{p_c}→{p_a}",
                                 'profit_perc': f"{profit_perc:.4f}",
@@ -381,7 +422,7 @@ def find_arbitrage_worker(prices, symbol_info_map_local, profit_threshold, tradi
                                 }
                             })
                         else:
-                            if profit < 0:
+                            if profit_ratio < 0:
                                 stats['low_profit']['negative'] += 1
                             else:
                                 stats['low_profit']['positive'] += 1
@@ -505,6 +546,7 @@ async def main_loop(analysis_executor, trading_executor):
         aggregated_stats = {
             'total_triangles': 0,
             'non_priority_start': 0,
+            'cannot_convert_budget': 0,
             'low_profit': {'negative': 0, 'positive': 0},
             'simulation_failures': {
                 'total': 0, 'FAIL_NO_DATA': 0, 'FAIL_STEP_SIZE': 0,
@@ -526,6 +568,7 @@ async def main_loop(analysis_executor, trading_executor):
                     if worker_stats:
                         aggregated_stats['total_triangles'] += worker_stats.get('total_triangles', 0)
                         aggregated_stats['non_priority_start'] += worker_stats.get('non_priority_start', 0)
+                        aggregated_stats['cannot_convert_budget'] += worker_stats.get('cannot_convert_budget', 0)
                         
                         # Aggrega low_profit
                         low_profit_stats = worker_stats.get('low_profit', {})
@@ -610,6 +653,7 @@ async def main_loop(analysis_executor, trading_executor):
             logger.info(f"Durata Analisi: {duration_ms:.2f} ms")
             logger.info(f"Triangoli validi trovati: {aggregated_stats['total_triangles']:,}")
             logger.info(f"  - Scartati (partenza non prioritaria): {aggregated_stats['non_priority_start']:,}")
+            logger.info(f"  - Scartati (budget non convertibile in unit asset): {aggregated_stats['cannot_convert_budget']:,}")
             logger.info(f"  - Scartati (fallimento simulazione): {total_sim_failures:,}")
             
             if total_sim_failures > 0:
@@ -633,13 +677,18 @@ async def main_loop(analysis_executor, trading_executor):
             logger.info(f"Analisi completata: {duration_ms:.1f}ms | Triangoli: {aggregated_stats['total_triangles']:,} | Opportunità: {total_profitable_found}")
 
 async def send_telegram_notification(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+    """H5 fix: usa aiohttp invece di requests.post (sync, bloccava l'event loop)."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
+    timeout = aiohttp.ClientTimeout(total=10)
     try:
-        async with asyncio.timeout(10):
-            response = requests.post(url, data={'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'Markdown'})
-            if response.status_code != 200:
-                logger.warning(f"Errore invio Telegram: {response.status_code} {response.text}")
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, data=payload) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.warning(f"Errore invio Telegram: {resp.status} {text}")
     except Exception as e:
         logger.error(f"Eccezione invio Telegram: {e}")
 
@@ -753,7 +802,7 @@ async def main():
             logger.error("Il bot continuerà solo con l'analisi (trading disabilitato)")
             config.AUTO_TRADE_ENABLED = False
     
-    getcontext().prec = 15
+    # H1 fix: rimossa risetting a 15. Precision è già 28 (default Python, settato a livello modulo).
     bot_start_time = time.time()
     
     logger.info("Avvio programma di arbitraggio triangolare Binance...")
