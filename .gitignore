@@ -15,4 +15,9 @@ __pycache__/
 
 # File specifici di alcuni editor di codice
 .vscode/
-.idea/ 
+.idea/
+
+# Dev artifacts (script wrapper, output run, requirements convertiti)
+*.ps1
+requirements-utf8.txt
+run-pid.txt
