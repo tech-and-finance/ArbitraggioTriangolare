@@ -33,7 +33,8 @@ WEBSOCKET_PING_INTERVAL = 20  # Intervallo ping WebSocket (secondi)
 # Configurazione performance
 MAX_EXECUTION_TIME = 10.0  # Tempo massimo di esecuzione per trade (secondi)
 MIN_PROFIT_THRESHOLD = Decimal('0.0005')  # Profitto minimo per notifica/trade (0.05%)
-ARBITRAGE_CHECK_INTERVAL = 5  # Secondi tra i cicli di analisi del mercato
+# Override via env var per benchmark/tuning senza redeploy.
+ARBITRAGE_CHECK_INTERVAL = int(os.environ.get('ARBITRAGE_CHECK_INTERVAL_OVERRIDE', '5'))
 
 # ============================================================================
 # CONFIGURAZIONE SISTEMA E PERFORMANCE
@@ -46,7 +47,8 @@ WEB_CORES = 1  # Core per il web server
 ANALYSIS_CORES = 14 # Core per l'analisi (16 - 1 - 1)
 
 # Ottimizzazioni performance per ridurre carico CPU
-MAX_CONCURRENT_ANALYSIS = 14  # Utilizza tutti i core disponibili per l'analisi
+# Override via env var per benchmark/tuning runtime senza redeploy.
+MAX_CONCURRENT_ANALYSIS = int(os.environ.get('MAX_CONCURRENT_ANALYSIS_OVERRIDE', '14'))
 ANALYSIS_BATCH_SIZE = 200  # Dimensione batch per analisi
 PRICE_CACHE_TTL = 5  # TTL cache prezzi (secondi)
 
