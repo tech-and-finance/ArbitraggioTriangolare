@@ -153,28 +153,36 @@ class TradingExecutor:
             return {'status': 'GENERAL_ERROR', 'error': str(e)}
     
     async def emergency_liquidation(self, asset: str, target_asset: str, quantity: Decimal) -> Dict:
-        """Liquidazione d'emergenza per tornare all'asset di partenza"""
+        """Liquidazione d'emergenza: vendi `asset` (in possesso) per ottenere `target_asset`.
+
+        H3 fix: il side era hardcoded a 'SELL' indipendentemente dalla direzione del symbol.
+        Se il pair Binance era BTCUSDT e l'asset in possesso fosse stato USDT (quote),
+        SELL avrebbe venduto BTC che non possediamo (saldo insufficiente o trade invertito).
+        """
         try:
-            # Trova la coppia di trading
-            symbol = f"{asset}{target_asset}"
-            
-            # Prova anche l'ordine inverso
-            if not self._symbol_exists(symbol):
-                symbol = f"{target_asset}{asset}"
-            
-            if not self._symbol_exists(symbol):
+            candidate_base_asset = f"{asset}{target_asset}"      # asset è base
+            candidate_quote_asset = f"{target_asset}{asset}"     # asset è quote
+
+            symbol = None
+            side = None
+            if self._symbol_exists(candidate_base_asset):
+                symbol = candidate_base_asset
+                side = 'SELL'  # vendo asset (base) in cambio di target (quote)
+            elif self._symbol_exists(candidate_quote_asset):
+                symbol = candidate_quote_asset
+                side = 'BUY'   # uso asset (quote) per comprare target (base)
+            else:
                 raise ValueError(f"Coppia di trading non trovata per {asset}/{target_asset}")
-            
-            # Esegui la liquidazione
-            result = await self.execute_market_order(symbol, 'SELL', quantity)
-            
+
+            result = await self.execute_market_order(symbol, side, quantity)
+
             if result['status'] in ['SUCCESS', 'TEST_SUCCESS']:
-                logger.warning(f"🆘 Liquidazione d'emergenza completata: {quantity} {asset} -> {target_asset}")
+                logger.warning(f"🆘 Liquidazione d'emergenza completata via {side} {symbol}: {quantity} {asset} -> {target_asset}")
                 return result
             else:
                 logger.error(f"❌ Liquidazione d'emergenza fallita: {result}")
                 return result
-                
+
         except Exception as e:
             logger.error(f"Errore liquidazione d'emergenza: {e}")
             return {'status': 'LIQUIDATION_ERROR', 'error': str(e)}
