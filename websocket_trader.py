@@ -12,7 +12,8 @@ import logging
 from decimal import Decimal
 from typing import Dict, Optional
 import websockets
-from binance.exceptions import BinanceAPIException
+from binance.client import Client
+from binance.exceptions import BinanceAPIException, BinanceOrderException
 import config
 
 logger = logging.getLogger(__name__)
@@ -211,12 +212,23 @@ class HybridTradingExecutor:
         self.ws_failures = 0
         self.max_ws_failures = 3
         
-        # Inizializza WebSocket trader se le credenziali sono disponibili
+        # C4 fix: inizializza ENTRAMBI i client se le credenziali sono disponibili.
+        # Il rest_client è il fallback quando WebSocket fallisce >= max_ws_failures volte.
         if config.BINANCE_API_KEY and config.BINANCE_SECRET_KEY:
             self.ws_trader = BinanceWebSocketTrader(
-                config.BINANCE_API_KEY, 
+                config.BINANCE_API_KEY,
                 config.BINANCE_SECRET_KEY
             )
+            try:
+                self.rest_client = Client(
+                    config.BINANCE_API_KEY,
+                    config.BINANCE_SECRET_KEY,
+                    testnet=config.DRY_RUN_MODE
+                )
+                logger.info(f"✅ REST fallback client initialized (testnet={config.DRY_RUN_MODE})")
+            except Exception as e:
+                logger.error(f"❌ REST client init failed: {e}")
+                self.rest_client = None
     
     async def execute_market_order(self, symbol: str, side: str, quantity: Decimal) -> Dict:
         """Esegue ordine di mercato con fallback automatico"""
@@ -248,17 +260,56 @@ class HybridTradingExecutor:
             raise Exception("Nessun client trading disponibile")
     
     async def _execute_rest_order(self, symbol: str, side: str, quantity: Decimal) -> Dict:
-        """Esegue ordine via REST API (fallback)"""
-        # Implementazione REST API (già presente nel trading_executor.py)
-        # Per ora restituiamo un placeholder
-        return {
-            'status': 'REST_FALLBACK',
+        """Esegue ordine via REST API (fallback). C4 fix: vera implementazione (era placeholder)."""
+        if not self.rest_client:
+            raise Exception("REST client non inizializzato (credenziali Binance mancanti)")
+
+        quantity_str = f"{quantity:.8f}".rstrip('0').rstrip('.')
+        params = {
             'symbol': symbol,
             'side': side,
-            'quantity': quantity,
-            'method': 'rest_api'
+            'type': 'MARKET',
+            'quantity': quantity_str,
         }
-    
+        start_time = time.time()
+        try:
+            if config.DRY_RUN_MODE:
+                # Test order: valida i parametri ma non esegue
+                await asyncio.to_thread(self.rest_client.create_test_order, **params)
+                logger.info(f"🧪 REST TEST ORDER: {side} {quantity_str} {symbol}")
+                return {
+                    'status': 'TEST_SUCCESS',
+                    'symbol': symbol,
+                    'side': side,
+                    'quantity': quantity,
+                    'price': None,
+                    'execution_time': (time.time() - start_time) * 1000,
+                    'method': 'rest_api',
+                }
+            else:
+                result = await asyncio.to_thread(self.rest_client.create_order, **params)
+                logger.info(f"📈 REST REAL ORDER: {side} {quantity_str} {symbol}")
+                price = Decimal(result['fills'][0]['price']) if result.get('fills') else None
+                return {
+                    'status': 'SUCCESS',
+                    'symbol': symbol,
+                    'side': side,
+                    'quantity': Decimal(result['executedQty']),
+                    'price': price,
+                    'execution_time': (time.time() - start_time) * 1000,
+                    'order_id': result.get('orderId'),
+                    'method': 'rest_api',
+                }
+        except BinanceAPIException as e:
+            logger.error(f"REST API Binance error per {symbol}: {e}")
+            return {'status': 'API_ERROR', 'error': str(e), 'method': 'rest_api'}
+        except BinanceOrderException as e:
+            logger.error(f"REST order Binance error per {symbol}: {e}")
+            return {'status': 'ORDER_ERROR', 'error': str(e), 'method': 'rest_api'}
+        except Exception as e:
+            logger.error(f"REST generic error per {symbol}: {e}")
+            return {'status': 'GENERAL_ERROR', 'error': str(e), 'method': 'rest_api'}
+
     async def connect_websocket(self):
         """Connette il WebSocket trader"""
         if self.ws_trader:
