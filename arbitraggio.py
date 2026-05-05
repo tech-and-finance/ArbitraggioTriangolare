@@ -49,8 +49,8 @@ total_profitable_opportunities_found = 0
 total_low_profit_positive_found = 0
 
 # Configurazione Telegram (caricata da variabili d'ambiente o file)
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', 'REDACTED-REVOKED-TELEGRAM-BOT-TOKEN')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '279229754')
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
 BUFFER_SICUREZZA = 0.8  # 80% della quantità disponibile
 
@@ -299,6 +299,9 @@ def adjust_quantity_for_step_size(quantity, step_size):
 
 def find_arbitrage_worker(prices, symbol_info_map_local, profit_threshold, trading_fee, currency_chunk, all_currencies, trade_graph):
     """Processo worker che cerca opportunità di arbitraggio navigando un grafo pre-calcolato."""
+    worker_pid = os.getpid()
+    print(f"[WORKER][{worker_pid}] Avvio analisi per {len(currency_chunk)} valute")
+    
     profitable_opportunities = []
     stats = {
         'total_triangles': 0,
@@ -369,10 +372,10 @@ def find_arbitrage_worker(prices, symbol_info_map_local, profit_threshold, tradi
                                 'path': f"{p_a}→{p_b}→{p_c}→{p_a}",
                                 'profit_perc': f"{profit_perc:.4f}",
                                 'pairs': [pair1_str, pair2_str, pair3_str],
-                                # Dettagli aggiuntivi per un logging migliore
                                 'details': {
+                                    'pairs': (pair1_str, pair2_str, pair3_str),
                                     'rates': (str(rate1), str(rate2), str(rate3)),
-                                    'prices': (str(prices.get(pair1_str,{}).get('ask' if p_a==symbol_info_map_local[pair1_str]['quote'] else 'bid')), 
+                                    'prices': (str(prices.get(pair1_str,{}).get('ask' if p_a==symbol_info_map_local[pair1_str]['quote'] else 'bid')),
                                                str(prices.get(pair2_str,{}).get('ask' if p_b==symbol_info_map_local[pair2_str]['quote'] else 'bid')),
                                                str(prices.get(pair3_str,{}).get('ask' if p_c==symbol_info_map_local[pair3_str]['quote'] else 'bid')))
                                 }
@@ -388,6 +391,7 @@ def find_arbitrage_worker(prices, symbol_info_map_local, profit_threshold, tradi
                         stats['simulation_failures']['UNKNOWN'] += 1
                         continue
     
+    print(f"[WORKER][{worker_pid}] Fine analisi: {stats['total_triangles']} triangoli, {len(profitable_opportunities)} opportunità")
     return {'profitable': profitable_opportunities, 'stats': stats}
 
 def simulate_trade(start_asset, end_asset, amount_in, prices, symbol_info, existing_pairs):
@@ -482,6 +486,10 @@ async def main_loop(analysis_executor, trading_executor):
         num_workers = min(config.MAX_CONCURRENT_ANALYSIS, analysis_executor._max_workers)
         chunk_size = (len(all_currencies) + num_workers - 1) // num_workers
         currency_chunks = [all_currencies[i:i + chunk_size] for i in range(0, len(all_currencies), chunk_size)]
+        
+        logger.info(f"[WORKER] Distribuzione lavoro: {num_workers} worker, {len(all_currencies)} valute, {chunk_size} valute per worker")
+        for i, chunk in enumerate(currency_chunks):
+            logger.info(f"[WORKER] Worker {i+1}: {len(chunk)} valute ({chunk[0]}...{chunk[-1]})")
         
         # --- Costruzione del Grafo di Trading (ottimizzata) ---
         trade_graph = {c: [] for c in all_currencies}
