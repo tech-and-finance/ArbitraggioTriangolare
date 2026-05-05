@@ -18,6 +18,27 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# H4 fix: l'attributo `.closed` su WebSocketClientProtocol è stato rimosso in
+# websockets >= 14 (sostituito da `.state`). Helper compatibile con entrambe le
+# versioni per non bloccare upgrade futuri della libreria.
+try:
+    from websockets.protocol import State as _WSState
+except ImportError:
+    _WSState = None
+
+
+def _is_ws_alive(ws):
+    if ws is None:
+        return False
+    if _WSState is not None and hasattr(ws, 'state'):
+        try:
+            return ws.state == _WSState.OPEN
+        except Exception:
+            pass
+    if hasattr(ws, 'closed'):
+        return not ws.closed
+    return True
+
 class BinanceWebSocketTrader:
     """Trader WebSocket per ordini ultra-veloci su Binance"""
     
@@ -40,7 +61,7 @@ class BinanceWebSocketTrader:
     async def connect(self):
         """Stabilisce connessione WebSocket persistente"""
         try:
-            if self.websocket and not self.websocket.closed:
+            if _is_ws_alive(self.websocket):
                 return
                 
             self.websocket = await websockets.connect(
@@ -62,7 +83,7 @@ class BinanceWebSocketTrader:
     
     async def disconnect(self):
         """Chiude la connessione WebSocket"""
-        if self.websocket and not self.websocket.closed:
+        if _is_ws_alive(self.websocket):
             await self.websocket.close()
             self.connected = False
             logger.info("🔌 Connessione WebSocket trading chiusa")
@@ -72,7 +93,7 @@ class BinanceWebSocketTrader:
         while self.connected:
             try:
                 await asyncio.sleep(self.ping_interval)
-                if self.websocket and not self.websocket.closed:
+                if _is_ws_alive(self.websocket):
                     await self.websocket.ping()
                     self.last_ping = time.time()
             except Exception as e:
@@ -200,7 +221,7 @@ class BinanceWebSocketTrader:
     
     def is_connected(self) -> bool:
         """Verifica se la connessione WebSocket è attiva"""
-        return self.connected and self.websocket and not self.websocket.closed
+        return self.connected and _is_ws_alive(self.websocket)
 
 class HybridTradingExecutor:
     """Executor ibrido che usa WebSocket con fallback a REST API"""
