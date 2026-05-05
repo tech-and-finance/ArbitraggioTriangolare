@@ -23,7 +23,13 @@ class BinanceWebSocketTrader:
     def __init__(self, api_key: str, secret_key: str):
         self.api_key = api_key
         self.secret_key = secret_key
-        self.ws_url = "wss://stream.binance.com:9443/ws/"
+        # C5 fix: trading endpoint (NOT market data endpoint).
+        # Market data was wss://stream.binance.com:9443/ws/ which silently rejects order.place commands.
+        self.ws_url = (
+            "wss://ws-api.testnet.binance.vision/ws-api/v3"
+            if config.DRY_RUN_MODE else
+            "wss://ws-api.binance.com:443/ws-api/v3"
+        )
         self.websocket = None
         self.connected = False
         self.last_ping = 0
