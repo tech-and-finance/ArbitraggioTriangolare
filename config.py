@@ -18,6 +18,8 @@ DRY_RUN_MODE = True
 
 # BUDGET MASSIMO PER TRADE (in USDT)
 TRADE_BUDGET_USDT = Decimal("10")
+# Budget per la SIMULAZIONE e i calcoli di esempio
+SIMULATION_BUDGET_USDT = Decimal("22")
 
 # TIMEOUT PER L'ESECUZIONE DEL TRADING (secondi)
 TRADING_TIMEOUT = 30
@@ -121,8 +123,6 @@ def print_config_summary():
         else:
             print("✅ Configurazione valida")
 
-# Configurazione Trading
-AUTO_TRADE_ENABLED = False  # Abilita il trading automatico
-DRY_RUN_MODE = True  # Modalità test (usa testnet Binance)
-TRADE_BUDGET_USDT = Decimal('10')  # Budget per trade REALE in USDT
-SIMULATION_BUDGET_USDT = Decimal('22') # Budget per la SIMULAZIONE e i calcoli di esempio 
+# H2 fix: rimosso blocco duplicato che sovrascrive le definizioni iniziali (drift risk).
+# Tutte le costanti (AUTO_TRADE_ENABLED, DRY_RUN_MODE, TRADE_BUDGET_USDT, SIMULATION_BUDGET_USDT)
+# sono ora definite UNA SOLA volta nel blocco principale in cima al file.
