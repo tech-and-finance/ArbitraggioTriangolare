@@ -44,7 +44,7 @@ WEB_CORES = 1  # Core per il web server
 ANALYSIS_CORES = 14 # Core per l'analisi (16 - 1 - 1)
 
 # Ottimizzazioni performance per ridurre carico CPU
-MAX_CONCURRENT_ANALYSIS = 2  # Limita analisi concorrenti
+MAX_CONCURRENT_ANALYSIS = 14  # Utilizza tutti i core disponibili per l'analisi
 ANALYSIS_BATCH_SIZE = 200  # Dimensione batch per analisi
 PRICE_CACHE_TTL = 5  # TTL cache prezzi (secondi)
 
