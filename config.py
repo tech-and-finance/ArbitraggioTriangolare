@@ -1,133 +1,133 @@
 """
-Configurazione per il Bot di Arbitraggio Triangolare
-Gestisce tutte le impostazioni per l'analisi e il trading automatico
+Configuration for the Triangular Arbitrage Bot
+Manages all settings for analysis and automated trading
 """
 
 import os
 from decimal import Decimal
 
 # ============================================================================
-# CONFIGURAZIONE TRADING AUTOMATICO
+# AUTOMATED TRADING CONFIGURATION
 # ============================================================================
 
-# FLAG DI SICUREZZA - DEVE ESSERE IMPOSTATO MANUALMENTE SU True
+# SAFETY FLAG - MUST BE MANUALLY SET TO True
 AUTO_TRADE_ENABLED = False
 
-# MODALITÀ TEST - Non esegue trade reali, solo simulazioni
+# TEST MODE - Does not execute real trades, only simulations
 DRY_RUN_MODE = True
 
-# BUDGET MASSIMO PER TRADE (in USDT)
+# MAXIMUM BUDGET PER TRADE (in USDT)
 TRADE_BUDGET_USDT = Decimal("10")
-# Budget per la SIMULAZIONE e i calcoli di esempio
+# Budget for SIMULATION and example calculations
 SIMULATION_BUDGET_USDT = Decimal("22")
 
-# TIMEOUT PER L'ESECUZIONE DEL TRADING (secondi)
+# TRADING EXECUTION TIMEOUT (seconds)
 TRADING_TIMEOUT = 30
 
-# Configurazione WebSocket Trading
-WEBSOCKET_TRADING_ENABLED = True  # Abilita trading via WebSocket
-WEBSOCKET_TIMEOUT = 5.0  # Timeout per ordini WebSocket (secondi)
-WEBSOCKET_MAX_FAILURES = 3  # Numero massimo fallimenti prima del fallback
-WEBSOCKET_PING_INTERVAL = 20  # Intervallo ping WebSocket (secondi)
+# WebSocket Trading configuration
+WEBSOCKET_TRADING_ENABLED = True  # Enable trading via WebSocket
+WEBSOCKET_TIMEOUT = 5.0  # Timeout for WebSocket orders (seconds)
+WEBSOCKET_MAX_FAILURES = 3  # Maximum number of failures before fallback
+WEBSOCKET_PING_INTERVAL = 20  # WebSocket ping interval (seconds)
 
-# Configurazione performance
-MAX_EXECUTION_TIME = 10.0  # Tempo massimo di esecuzione per trade (secondi)
-MIN_PROFIT_THRESHOLD = Decimal('0.0005')  # Profitto minimo per notifica/trade (0.05%)
-# Override via env var per benchmark/tuning senza redeploy.
+# Performance configuration
+MAX_EXECUTION_TIME = 10.0  # Maximum execution time per trade (seconds)
+MIN_PROFIT_THRESHOLD = Decimal('0.0005')  # Minimum profit for notification/trade (0.05%)
+# Override via env var for benchmark/tuning without redeploy.
 ARBITRAGE_CHECK_INTERVAL = int(os.environ.get('ARBITRAGE_CHECK_INTERVAL_OVERRIDE', '5'))
 
 # ============================================================================
-# CONFIGURAZIONE SISTEMA E PERFORMANCE
+# SYSTEM AND PERFORMANCE CONFIGURATION
 # ============================================================================
 
-# Configurazione CPU e processi
-TOTAL_CORES = 16  # Numero totale di core CPU (impostato manualmente)
-TRADING_CORES = 1  # Core per il trading
-WEB_CORES = 1  # Core per il web server
-ANALYSIS_CORES = 14 # Core per l'analisi (16 - 1 - 1)
+# CPU and process configuration
+TOTAL_CORES = 16  # Total number of CPU cores (manually set)
+TRADING_CORES = 1  # Cores for trading
+WEB_CORES = 1  # Cores for the web server
+ANALYSIS_CORES = 14 # Cores for analysis (16 - 1 - 1)
 
-# Ottimizzazioni performance per ridurre carico CPU
-# Override via env var per benchmark/tuning runtime senza redeploy.
-# Benchmark 2026-05-05 ha mostrato 4 worker = sweet spot (avg 90ms/ciclo).
-# 8 worker +28%, 14 worker +75% per overhead IPC (pickle symbol_info_map per worker call).
-# Vedi Vault/Projects/arbitraggio-triangolare-deep-analysis-2026-05-05.md § Benchmark parallelismo.
+# Performance optimizations to reduce CPU load
+# Override via env var for runtime benchmark/tuning without redeploy.
+# 2026-05-05 benchmark showed 4 workers = sweet spot (avg 90ms/cycle).
+# 8 workers +28%, 14 workers +75% due to IPC overhead (pickle symbol_info_map per worker call).
+# See Vault/Projects/arbitraggio-triangolare-deep-analysis-2026-05-05.md § Benchmark parallelismo.
 MAX_CONCURRENT_ANALYSIS = int(os.environ.get('MAX_CONCURRENT_ANALYSIS_OVERRIDE', '4'))
-ANALYSIS_BATCH_SIZE = 200  # Dimensione batch per analisi
-PRICE_CACHE_TTL = 5  # TTL cache prezzi (secondi)
+ANALYSIS_BATCH_SIZE = 200  # Batch size for analysis
+PRICE_CACHE_TTL = 5  # Price cache TTL (seconds)
 
 # ============================================================================
-# CONFIGURAZIONE BINANCE API
+# BINANCE API CONFIGURATION
 # ============================================================================
 
-# Carica le chiavi API da variabili d'ambiente per sicurezza
+# Load API keys from environment variables for security
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', '')
 BINANCE_SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY', '')
 
-# URL API Binance
+# Binance API URLs
 BINANCE_API_URL = "https://api.binance.com"
 BINANCE_TESTNET_URL = "https://testnet.binance.vision"
 
-# Usa testnet se DRY_RUN_MODE è True
+# Use testnet if DRY_RUN_MODE is True
 def get_binance_url():
-    """Restituisce l'URL corretto per Binance in base alla modalità"""
+    """Returns the correct Binance URL based on the mode"""
     return BINANCE_TESTNET_URL if DRY_RUN_MODE else BINANCE_API_URL
 
 # ============================================================================
-# CONFIGURAZIONE LOGGING TRADING
+# TRADING LOGGING CONFIGURATION
 # ============================================================================
 
-# File di log per il trading
+# Log files for trading
 TRADING_LOG_FILE = "trading_log.txt"
 TRADING_ERROR_LOG_FILE = "trading_errors.txt"
 
 # ============================================================================
-# CONFIGURAZIONE TELEGRAM
+# TELEGRAM CONFIGURATION
 # ============================================================================
 
-# Configurazione Telegram
+# Telegram configuration
 TELEGRAM_BOT_TOKEN = 'YOUR_BOT_TOKEN'
 TELEGRAM_CHAT_ID = 'YOUR_CHAT_ID'
-TELEGRAM_COOLDOWN = 0  # Cooldown tra notifiche (secondi)
+TELEGRAM_COOLDOWN = 0  # Cooldown between notifications (seconds)
 
 # ============================================================================
-# VALIDAZIONE CONFIGURAZIONE
+# CONFIGURATION VALIDATION
 # ============================================================================
 
 def validate_config():
-    """Valida la configurazione e restituisce errori se presenti"""
+    """Validates the configuration and returns errors if present"""
     errors = []
-    
+
     if AUTO_TRADE_ENABLED:
         if not BINANCE_API_KEY:
-            errors.append("BINANCE_API_KEY non impostata")
+            errors.append("BINANCE_API_KEY not set")
         if not BINANCE_SECRET_KEY:
-            errors.append("BINANCE_SECRET_KEY non impostata")
+            errors.append("BINANCE_SECRET_KEY not set")
         if TRADE_BUDGET_USDT <= 0:
-            errors.append("TRADE_BUDGET_USDT deve essere > 0")
-    
+            errors.append("TRADE_BUDGET_USDT must be > 0")
+
     return errors
 
 def print_config_summary():
-    """Stampa un riepilogo della configurazione"""
-    print("=== CONFIGURAZIONE TRADING AUTOMATICO ===")
-    print(f"Trading Abilitato: {'✅ SÌ' if AUTO_TRADE_ENABLED else '❌ NO'}")
-    print(f"Modalità Test: {'✅ SÌ' if DRY_RUN_MODE else '❌ NO'}")
+    """Prints a summary of the configuration"""
+    print("=== AUTOMATED TRADING CONFIGURATION ===")
+    print(f"Trading Enabled: {'✅ YES' if AUTO_TRADE_ENABLED else '❌ NO'}")
+    print(f"Test Mode: {'✅ YES' if DRY_RUN_MODE else '❌ NO'}")
     print(f"Budget per Trade: {TRADE_BUDGET_USDT} USDT")
-    print(f"Timeout Trading: {TRADING_TIMEOUT} secondi")
-    print(f"Core Totali: {TOTAL_CORES}")
-    print(f"Core Analisi: {ANALYSIS_CORES}")
-    print(f"Core Trading: {TRADING_CORES}")
+    print(f"Trading Timeout: {TRADING_TIMEOUT} seconds")
+    print(f"Total Cores: {TOTAL_CORES}")
+    print(f"Analysis Cores: {ANALYSIS_CORES}")
+    print(f"Trading Cores: {TRADING_CORES}")
     print("==========================================")
-    
+
     if AUTO_TRADE_ENABLED:
         errors = validate_config()
         if errors:
-            print("⚠️ ERRORI DI CONFIGURAZIONE:")
+            print("⚠️ CONFIGURATION ERRORS:")
             for error in errors:
                 print(f"  - {error}")
         else:
-            print("✅ Configurazione valida")
+            print("✅ Configuration valid")
 
-# H2 fix: rimosso blocco duplicato che sovrascrive le definizioni iniziali (drift risk).
-# Tutte le costanti (AUTO_TRADE_ENABLED, DRY_RUN_MODE, TRADE_BUDGET_USDT, SIMULATION_BUDGET_USDT)
-# sono ora definite UNA SOLA volta nel blocco principale in cima al file.
+# H2 fix: removed duplicate block overwriting initial definitions (drift risk).
+# All constants (AUTO_TRADE_ENABLED, DRY_RUN_MODE, TRADE_BUDGET_USDT, SIMULATION_BUDGET_USDT)
+# are now defined ONCE in the main block at the top of the file.
