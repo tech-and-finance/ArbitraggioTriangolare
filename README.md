@@ -1,146 +1,145 @@
-# Bot di Arbitraggio Triangolare per Binance
+# Triangular Arbitrage Bot for Binance
 
-Questo progetto è un bot avanzato per il rilevamento e l'esecuzione (opzionale) di opportunità di arbitraggio triangolare sull'exchange di criptovalute Binance. Il bot si connette in tempo reale ai flussi di dati di mercato, calcola migliaia di potenziali percorsi di arbitraggio al secondo e implementa una serie di filtri strategici e tecnici per identificare e, se abilitato, eseguire solo le opportunità realistiche.
+This project is an advanced bot for detecting and (optionally) executing triangular arbitrage opportunities on the Binance cryptocurrency exchange. The bot connects to real-time market data streams, calculates thousands of potential arbitrage paths per second, and implements a series of strategic and technical filters to identify and, if enabled, execute only realistic opportunities.
 
-## Architettura e Design
+## Architecture and Design
 
-Il bot è costruito su un'architettura ibrida ad alte prestazioni che sfrutta il meglio della programmazione concorrente in Python per massimizzare l'efficienza e la stabilità.
+The bot is built on a high-performance hybrid architecture that leverages the best of concurrent programming in Python to maximize efficiency and stability.
 
-### Diagramma Architetturale
+### Architectural Diagram
 
 ```mermaid
 graph TD
-    subgraph "Sistema di Arbitraggio"
+    subgraph "Arbitrage System"
         
-        subgraph "Processo Principale (arbitraggio.py)"
+        subgraph "Main Process (arbitraggio.py)"
             direction LR
-            A[Loop<br/>asyncio] ==> PP("Process Pool<br/>Executor")
-            A --> WSM("Manager<br/>WebSocket Dati")
-            A --> TN("Notifiche<br/>Telegram")
-            A --> TQ("Coda<br/>Trading")
+            A[asyncio<br/>Loop] ==> PP("Process Pool<br/>Executor")
+            A --> WSM("Data WebSocket<br/>Manager")
+            A --> TN("Telegram<br/>Notifications")
+            A --> TQ("Trading<br/>Queue")
         end
 
-        subgraph "Processi Worker (Calcolo intensivo CPU)"
+        subgraph "Worker Processes (CPU-intensive Calculation)"
             W["Worker 1"]
             W2["Worker 2"]
             W3["Worker ..."]
         end
         
-        subgraph "Processo Trading Dedicato (trading_executor.py)"
-            TE("Esecutore<br/>Trading") --> HT("Trader Ibrido<br/>(WebSocket + REST)")
+        subgraph "Dedicated Trading Process (trading_executor.py)"
+            TE("Trade<br/>Executor") --> HT("Hybrid Trader<br/>(WebSocket + REST)")
         end
 
     end
 
-    subgraph "Servizi Esterni"
+    subgraph "External Services"
         direction LR
         BD["Binance<br/>Market Data API<br/>(WebSocket)"]
         BT["Binance<br/>Trading API<br/>(WebSocket/REST)"]
     end
 
-    WSM -- "Riceve dati in tempo reale" --> BD
-    PP -- "Delega calcoli" --> W
-    PP -- "Delega calcoli" --> W2
-    PP -- "Delega calcoli" --> W3
+    WSM -- "Receives real-time data" --> BD
+    PP -- "Delegates calculations" --> W
+    PP -- "Delegates calculations" --> W2
+    PP -- "Delegates calculations" --> W3
     
-    W -- "Ritorna<br/>opportunità" --> A
-    W2 -- "Ritorna<br/>opportunità" --> A
-    W3 -- "Ritorna<br/>opportunità" --> A
+    W -- "Returns<br/>opportunities" --> A
+    W2 -- "Returns<br/>opportunities" --> A
+    W3 -- "Returns<br/>opportunities" --> A
     
-    A -- "Se profittevole" --> TN
-    A -- "Se AUTO_TRADE_ENABLED" --> TQ
+    A -- "If profitable" --> TN
+    A -- "If AUTO_TRADE_ENABLED" --> TQ
 
-    TQ -- "Invia ordine da eseguire" --> TE
-    HT -- "Esegue trade" --> BT
+    TQ -- "Sends order to execute" --> TE
+    HT -- "Executes trade" --> BT
 ```
 
-### 1. `asyncio` per l'I/O di Rete
-Il cuore del programma è gestito da `asyncio`. Questo gli permette di gestire in modo estremamente efficiente centinaia di operazioni di Input/Output simultaneamente, come:
-- Mantenere aperte e ricevere dati da multiple connessioni WebSocket con Binance.
-- Inviare notifiche all'API di Telegram senza "congelare" il resto del programma.
-- Eseguire il trading ultra-veloce tramite una connessione WebSocket dedicata.
-- Gestire task periodici come i riepiloghi orari.
+### 1. `asyncio` for Network I/O
+The core of the program is managed by `asyncio`. This allows it to handle hundreds of simultaneous Input/Output operations with extreme efficiency, such as:
+- Keeping multiple WebSocket connections with Binance open and receiving data.
+- Sending notifications to the Telegram API without "freezing" the rest of the program.
+- Executing ultra-fast trading via a dedicated WebSocket connection.
+- Managing periodic tasks like hourly summaries.
 
-### 2. `ProcessPoolExecutor` per i Calcoli Intensivi
-L'analisi delle opportunità di arbitraggio è un'operazione che richiede un uso intensivo della CPU. Per non bloccare il loop di `asyncio`, questi calcoli vengono delegati a un **pool di processi separati**. Questo permette al bot di sfruttare tutti i core della CPU per i calcoli pesanti, mentre il thread principale rimane libero e reattivo per gestire la rete e il trading.
+### 2. `ProcessPoolExecutor` for Intensive Calculations
+Analyzing arbitrage opportunities is a CPU-intensive operation. To avoid blocking the `asyncio` loop, these calculations are delegated to a **separate process pool**. This allows the bot to leverage all CPU cores for heavy computations, while the main thread remains free and responsive to manage the network and trading.
 
-### 3. Approccio a Grafo per l'Efficienza
-A differenza di un approccio a forza bruta, questo bot implementa una logica molto più intelligente basata sulla **teoria dei grafi**:
-1.  **Costruzione del Grafo:** All'inizio di ogni ciclo, il bot costruisce una "mappa" delle connessioni dirette (coppie di trading) tra tutte le valute.
-2.  **Navigazione Efficiente:** I processi worker esplorano **solo ed esclusivamente percorsi di trading a 3 passi che esistono realmente sul mercato**, eliminando milioni di calcoli inutili e concentrando la potenza della CPU solo sull'analisi di opportunità concrete.
+### 3. Graph-Based Approach for Efficiency
+Unlike a brute-force approach, this bot implements a much smarter logic based on **graph theory**:
+1.  **Graph Construction:** At the beginning of each cycle, the bot builds a "map" of direct connections (trading pairs) between all currencies.
+2.  **Efficient Navigation:** The worker processes explore **only and exclusively 3-step trading paths that actually exist on the market**, eliminating millions of useless calculations and focusing CPU power only on analyzing concrete opportunities.
 
-## Funzionalità e Filtri
+## Features and Filters
 
-L'efficacia del bot risiede nella sua capacità di scartare il "rumore" di mercato e identificare operazioni valide.
+The bot's effectiveness lies in its ability to filter out market "noise" and identify valid trades.
 
-### Filtri Tecnici di Simulazione
-Ogni potenziale triangolo viene sottoposto a una simulazione realistica che deve superare i seguenti controlli per ogni "gamba" del percorso:
-- **Liquidità:** La quantità richiesta per il trade deve essere disponibile sull'order book al miglior prezzo (best bid/ask).
-- **`minQty`:** La quantità scambiata deve essere superiore alla soglia minima richiesta da Binance.
-- **`minNotional`:** Il valore totale del trade (quantità x prezzo) deve superare il valore nozionale minimo.
-- **`stepSize`:** La quantità scambiata viene arrotondata per difetto per rispettare la precisione decimale richiesta.
+### Technical Simulation Filters
+Each potential triangle is subjected to a realistic simulation that must pass the following checks for each "leg" of the path:
+- **Liquidity:** The required quantity for the trade must be available on the order book at the best price (best bid/ask).
+- **`minQty`:** The traded quantity must be above the minimum threshold required by Binance.
+- **`minNotional`:** The total value of the trade (quantity x price) must exceed the minimum notional value.
+- **`stepSize`:** The traded quantity is rounded down to comply with the required decimal precision.
 
-### Analisi dell'Importo Ottimale
-Per ogni opportunità profittevole identificata, il bot esegue un'analisi aggiuntiva per determinare l'**importo massimo investibile** in modo sicuro.
-- **Calcolo:** Viene calcolata la quantità massima eseguibile per ogni step del triangolo, considerando la liquidità disponibile al primo livello dell'order book.
-- **Buffer di Sicurezza:** Per evitare lo slippage, viene applicato un buffer conservativo (es. 80%) sulla quantità disponibile.
-- **Logging:** L'importo ottimale calcolato e i volumi disponibili per ogni coppia vengono salvati nel file di log, fornendo dati cruciali per valutare la reale fattibilità dell'opportunità.
+### Optimal Amount Analysis
+For each profitable opportunity identified, the bot performs an additional analysis to determine the **maximum safely investable amount**.
+- **Calculation:** The maximum executable quantity is calculated for each step of the triangle, considering the liquidity available at the first level of the order book.
+- **Safety Buffer:** To avoid slippage, a conservative buffer (e.g., 80%) is applied to the available quantity.
+- **Logging:** The calculated optimal amount and the available volumes for each pair are saved in the log file, providing crucial data to assess the real feasibility of the opportunity.
 
-## Trading Automatico (Ibrido WebSocket/REST)
+## Automated Trading (Hybrid WebSocket/REST)
 
-Il bot include un modulo opzionale per l'esecuzione automatica dei trade, progettato per la massima velocità e sicurezza.
+The bot includes an optional module for automatic trade execution, designed for maximum speed and safety.
 
-- **Modalità Ibrida:** Utilizza primariamente una connessione **WebSocket per piazzare ordini**, riducendo drasticamente la latenza rispetto alle tradizionali API REST. In caso di fallimento della connessione WebSocket, il sistema esegue automaticamente un **fallback all'API REST** per garantire l'esecuzione.
-- **Processo Dedicato:** L'esecuzione del trading avviene in un processo completamente separato con affinità impostata su un core della CPU dedicato, per non essere influenzato o rallentato dall'analisi del mercato.
-- **Sicurezza:**
-  - Il trading automatico è **disabilitato di default** e deve essere attivato esplicitamente nel file di configurazione.
-  - È presente una modalità **Dry Run (Testnet)** che permette di testare l'intera logica di trading sulla testnet di Binance senza usare fondi reali.
-  - In caso di fallimento di un'operazione intermedia, una funzione di **liquidazione d'emergenza** tenta di rivendere immediatamente gli asset acquistati per riportare il capitale alla valuta di partenza.
+- **Hybrid Mode:** It primarily uses a **WebSocket connection to place orders**, drastically reducing latency compared to traditional REST APIs. In case of WebSocket connection failure, the system automatically **falls back to the REST API** to ensure execution.
+- **Dedicated Process:** Trade execution occurs in a completely separate process with its affinity set to a dedicated CPU core, to avoid being influenced or slowed down by market analysis.
+- **Safety:**
+  - Automated trading is **disabled by default** and must be explicitly enabled in the configuration file.
+  - A **Dry Run (Testnet) mode** is available, allowing the entire trading logic to be tested on the Binance testnet without using real funds.
+  - In case of an intermediate trade failure, an **emergency liquidation** function attempts to immediately sell the purchased assets to return the capital to the starting currency.
 
-## Configurazione Centralizzata
+## Centralized Configuration
 
-Tutte le impostazioni chiave del bot sono state centralizzate nel file `config.py` per una gestione semplice e sicura. Questo include:
-- Abilitazione del trading automatico e della modalità testnet.
-- Credenziali API di Binance e Telegram.
-- Parametri di performance come la soglia di profitto, il budget di simulazione e l'intervallo tra i cicli di analisi.
-- Allocazione dei core della CPU per i processi di analisi e trading.
+All key settings for the bot have been centralized in the `config.py` file for easy and safe management. This includes:
+- Enabling auto-trading and testnet mode.
+- Binance and Telegram API credentials.
+- Performance parameters like the profit threshold, simulation budget, and the interval between analysis cycles.
+- CPU core allocation for analysis and trading processes.
 
-## Statistiche e Logging
-Per la massima trasparenza, il bot fornisce un riepilogo statistico dettagliato alla fine di ogni ciclo di analisi. I log delle opportunità vengono salvati in `profitable_opportunities.txt` con codifica UTF-8.
+## Statistics and Logging
+For maximum transparency, the bot provides a detailed statistical summary at the end of each analysis cycle. Opportunity logs are saved in `profitable_opportunities.txt` with UTF-8 encoding.
 
-## Installazione e Avvio
+## Installation and Setup
 
-1.  **Clonare il Repository**
+1.  **Clone the Repository**
     ```bash
     git clone https://github.com/tech-and-finance/ArbitraggioTriangolare.git
     cd ArbitraggioTriangolare
     ```
 
-2.  **Creare un Ambiente Virtuale**
+2.  **Create a Virtual Environment**
     ```bash
     python -m venv venv
     ```
-    Su Windows:
+    On Windows:
     ```powershell
     .\venv\Scripts\Activate.ps1
     ```
-    Su macOS/Linux:
+    On macOS/Linux:
     ```bash
     source venv/bin/activate
     ```
 
-3.  **Installare le Dipendenze**
+3.  **Install Dependencies**
     ```bash
     pip install -r requirements.txt
     ```
 
-4.  **Configurare `config.py`**
-    Apri il file `config.py` e inserisci le tue credenziali API (se vuoi abilitare il trading) e i parametri desiderati.
+4.  **Configure `config.py`**
+    Open the `config.py` file and enter your API credentials (if you want to enable trading) and the desired parameters.
 
-5.  **Avviare il Bot**
+5.  **Start the Bot**
     ```bash
     python arbitraggio.py
     ```
-
 ---
-*Disclaimer: Questo strumento è fornito a scopo educativo e sperimentale. Il trading di criptovalute comporta rischi significativi. L'autore non si assume alcuna responsabilità per eventuali perdite finanziarie. Usare a proprio rischio.* 
+*Disclaimer: This tool is provided for educational and experimental purposes only. Cryptocurrency trading involves significant risks. The author assumes no responsibility for any financial losses. Use at your own risk.* 
