@@ -21,3 +21,7 @@ __pycache__/
 *.ps1
 requirements-utf8.txt
 run-pid.txt
+
+# Claude Code workflow files (NEVER commit — possono contenere credenziali, info sensibili)
+.claude/
+CLAUDE.md
