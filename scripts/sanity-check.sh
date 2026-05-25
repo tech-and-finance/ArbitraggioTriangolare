@@ -65,7 +65,9 @@ fi
 # C. Binance connectivity + clock drift vs server
 section "C. Binance connectivity + clock drift"
 SERVER_TIME=$(curl -s https://api.binance.com/api/v3/time --max-time 5 2>/dev/null | grep -oE '"serverTime":[0-9]+' | cut -d: -f2)
-LOCAL_TIME=$(date +%s%3N)
+# Use python for portable ms timestamp; `date +%s%3N` is unreliable across distros
+# (Ubuntu 26.04 GNU coreutils returns nanoseconds with %3N as suffix instead of truncated ms).
+LOCAL_TIME=$(python3 -c "import time; print(int(time.time() * 1000))" 2>/dev/null || date +%s%3N)
 if [ -n "$SERVER_TIME" ]; then
     DRIFT=$((SERVER_TIME - LOCAL_TIME))
     ABS_DRIFT=${DRIFT#-}
