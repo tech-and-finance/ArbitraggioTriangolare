@@ -1,6 +1,10 @@
 # Triangular Arbitrage Bot for Binance
 
-This project is an advanced bot for detecting and (optionally) executing triangular arbitrage opportunities on the Binance cryptocurrency exchange. The bot connects to real-time market data streams, calculates thousands of potential arbitrage paths per second, and implements a series of strategic and technical filters to identify and, if enabled, execute only realistic opportunities.
+> **Status**: showcase / educational. This bot exists to demonstrate production-grade Python concurrency, low-latency exchange trading, and financial safety patterns. It was deliberately **never deployed with real capital** — empirical benchmarks (see _Empirical results_ below) showed the retail edge is consistently negative-EV against HFT-saturated markets. A Rust port and shadow-trader live in [`tech-and-finance/ArbitraggioTriangolare-Rust`](https://github.com/tech-and-finance/ArbitraggioTriangolare-Rust).
+
+This project is an advanced bot for detecting and (optionally) executing triangular arbitrage opportunities on the Binance cryptocurrency exchange. It connects to real-time market data streams, calculates thousands of potential arbitrage paths per second, and applies strategic and technical filters to identify only realistic opportunities.
+
+> 🇮🇹 [Versione italiana del README](./README.it.md)
 
 ## Architecture and Design
 
@@ -137,9 +141,33 @@ For maximum transparency, the bot provides a detailed statistical summary at the
 4.  **Configure `config.py`**
     Open the `config.py` file and enter your API credentials (if you want to enable trading) and the desired parameters.
 
-5.  **Start the Bot**
+5.  **Start the Bot (dry-run, testnet)**
     ```bash
     python arbitraggio.py
     ```
+
+    The bot ships with `AUTO_TRADE_ENABLED=False` and `DRY_RUN_MODE=True` by default. To enable real trading you must explicitly flip both flags in `config.py` and provide live Binance API credentials. Don't.
+
+## Empirical results (2026)
+
+After bringing the bot back from dormancy in May 2026, three independent measurements made it clear the bot is **technically sound but economically unviable** for retail capital on Binance:
+
+- **EC2 Tokyo benchmark (2026-05-09)** — 24h run with the event-driven coalescing variant (50ms windows). 22+ profit-flagged opportunities observed in 4h (top: `USDC→USDT→NOT→USDC +0.7142%` net, recurrent: `USDC→TRY→DYM→USDC`). All in the +0.05–0.5% bps range. Network round-trip from Tokyo halves vs Europe but doesn't close the gap with co-located HFT.
+- **Rust port + shadow trader (2026-05-10 → 2026-05-13)** — full rewrite in Rust (tokio current_thread, Fixed8 i128 maths, seqlock orderbook, ~243 tests). Deployed a shadow trader on EC2 that replays detected opportunities against the live order book **without spending capital** and logs the realistic fill price after slippage + min_qty + step_size truncation. 58k+ unique opps observed, 15+ "ghost paths" survived only because the kill-switch didn't model the exact filter Binance applied; once modelled, shadow PnL was reliably negative.
+- **Falsification test H1 (2026-05-13)** — attempted to disprove the negative-EV thesis by isolating non-exotic paths with positive average shadow_bps. Three candidates surfaced (ETH-LTC via USDT/USDC/FDUSD) — turned out **all 276 records were concentrated in a single 30-second flash event**, bimodal distribution ±50 bps = execution roulette, not strategy. Thesis held.
+
+Detailed write-ups live in the parallel knowledge base (private). The conclusion is the same one most retail triangular-arb attempts reach: on a top-3 exchange the spread between gross detected bps and net post-fill bps is negative once you correctly model exchange filters, depth, and adverse selection on fills.
+
+## Repo status / showcase
+
+| Item | Status |
+|---|---|
+| License | [`MIT`](./LICENSE) |
+| Telegram token in git history | revoked (2026-05-04) + rotated |
+| README (EN-first) | this file |
+| Italian README (legacy) | [`README.it.md`](./README.it.md) |
+| Rust spinoff | [`ArbitraggioTriangolare-Rust`](https://github.com/tech-and-finance/ArbitraggioTriangolare-Rust) |
+| Real trading | never enabled — by design |
+
 ---
 *Disclaimer: This tool is provided for educational and experimental purposes only. Cryptocurrency trading involves significant risks. The author assumes no responsibility for any financial losses. Use at your own risk.* 
