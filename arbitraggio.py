@@ -33,7 +33,8 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration Constants ---
 SYMBOLS_PER_CONNECTION = 200  # Number of symbols per WebSocket connection
-TRADING_FEE = Decimal("0.00075")      # Fee per trade (0.075% with BNB discount)
+TRADING_FEE = Decimal("0.00075")      # Fee per trade (0.075% with BNB discount, generic spot pair)
+TRADING_FEE_USDC = Decimal("0.0007125")  # Fee per trade for USDC pairs (0.07125% with BNB discount)
 STARTING_ASSETS = {'USDT', 'USDC', 'FDUSD', 'DAI', 'TUSD', 'BTC', 'ETH', 'SOL'} # Starting assets for arbitrage analysis
 OPPORTUNITY_COOLDOWN = 60  # Seconds before re-notifying the same triangle
 
@@ -49,16 +50,37 @@ profitable_opportunities_set = {}
 total_profitable_opportunities_found = 0
 total_low_profit_positive_found = 0
 
+# Event-driven globals (populated by bootstrap_indexes after symbol_info_map ready).
+update_queue = None  # asyncio.Queue, lazily created in main() so the event loop owns it
+triangle_index_global = {}  # symbol -> list[(p_a, p_b, p_c)]
+all_triangles_global = []
+all_currencies_global = []
+existing_pairs_global = {}  # base -> {quote -> symbol}, precomputed
+indexes_ready = False
+COALESCING_WINDOW_MS = int(os.environ.get('COALESCING_WINDOW_MS', '100'))
+QUEUE_BACKPRESSURE_LIMIT = int(os.environ.get('QUEUE_BACKPRESSURE_LIMIT', '5000'))
+PRICE_STALENESS_SEC = int(os.environ.get('PRICE_STALENESS_SEC', '60'))
+
 # Telegram configuration (loaded from environment variables or file)
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
-BUFFER_SICUREZZA = 0.8  # 80% of available quantity
+BUFFER_SICUREZZA = Decimal('0.8')  # 80% of available quantity. Decimal to avoid Decimal*float TypeError in calcola_importo_ottimale_con_buffer.
 
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {msg}")
 
-getcontext().prec = 28  # H1 fix: was 12 but main() reset to 15 and worker process default 28 → inconsistency
+# Backpressure drop telemetry: sampled WARN log every N drops to avoid log flood.
+_backpressure_drops_total = 0
+_backpressure_drops_sample = 100
+
+def _backpressure_drop(symbol, qsize, reason):
+    global _backpressure_drops_total
+    _backpressure_drops_total += 1
+    if _backpressure_drops_total % _backpressure_drops_sample == 1:
+        logger.warning(f"[BACKPRESSURE] Dropped update_queue push (total={_backpressure_drops_total}, qsize={qsize}, last_symbol={symbol}, reason={reason})")
+
+getcontext().prec = 28  # H1 fix: was 12 but main() reset to 15 and worker process default 28 -> inconsistency
 
 # Binance WebSocket URL
 WS_URL = "wss://stream.binance.com:9443/stream"
@@ -235,19 +257,33 @@ async def handle_message(msg):
         'bid': Decimal(data['b']),
         'ask': Decimal(data['a']),
         'bid_qty': Decimal(data['B']),
-        'ask_qty': Decimal(data['A'])
+        'ask_qty': Decimal(data['A']),
+        'ts': time.time()
     }
+
+    # Event-driven trigger: push symbol so event_loop can re-evaluate the triangles
+    # touching it. Log drops under backpressure (sampled) so we know if we're losing
+    # signal during volatility spikes.
+    if indexes_ready and update_queue is not None:
+        qsize = update_queue.qsize()
+        if qsize < QUEUE_BACKPRESSURE_LIMIT:
+            try:
+                update_queue.put_nowait(symbol)
+            except asyncio.QueueFull:
+                _backpressure_drop(symbol, qsize, reason='QueueFull')
+        else:
+            _backpressure_drop(symbol, qsize, reason='LimitReached')
 
 def format_opportunity_message(opp, prices):
     """Formats an arbitrage opportunity into a readable Telegram message."""
     try:
         path = opp['path']
-        steps = path.split('→')
+        steps = path.split('->')
 
         # Add a robustness check for invalid paths
         if len(steps) < 4:
             log(f"[MSG][WARN] Received invalid or incomplete path: '{path}'")
-            return f"⚠️ *Anomalous data*\n\nPath: `{path}`. Cannot generate a valid example."
+            return f"[WARN] *Anomalous data*\n\nPath: `{path}`. Cannot generate a valid example."
 
         # Safely convert received data (may be strings)
         profit = Decimal(str(opp['profit']))
@@ -255,7 +291,7 @@ def format_opportunity_message(opp, prices):
 
         details = opp.get('details', {})
         if not details:
-            return f"⚠️ *INCOMPLETE DATA*\n\nPath: `{path}`. Cannot generate example."
+            return f"[WARN] *INCOMPLETE DATA*\n\nPath: `{path}`. Cannot generate example."
 
         # Safely convert details
         rates = tuple(Decimal(str(r)) for r in details['rates'])
@@ -273,24 +309,24 @@ def format_opportunity_message(opp, prices):
         finale_usdt = investimento_usdt + guadagno_usdt
         commissioni_usdt = investimento_usdt * (1 - (1 - TRADING_FEE)**3)
 
-        message = f"⚡ *ARBITRAGE OPPORTUNITY*\n\n" \
-                    f"🔄 *Path:* `{path}`\n" \
-                    f"💰 *Estimated Net Profit:* `{profit_percentage:.4f}%`\n\n" \
-                    f"💵 *Example on {investimento_usdt} USDT:*\n" \
-                    f"• Investment: `{investimento_usdt:.2f} USDT`\n" \
-                    f"• Estimated Final: `{finale_usdt:.4f} USDT`\n" \
-                    f"• Net Gain: `{guadagno_usdt:.4f} USDT`\n" \
-                    f"• Estimated Fees: `{commissioni_usdt:.4f} USDT`\n\n" \
-                    f"📈 *Operations and Prices (used in calculation):*\n" \
-                    f"1. `{steps[0]}→{steps[1]}` (`{pair1_str}` @ `{price_val1:.8f}`)\n" \
-                    f"2. `{steps[1]}→{steps[2]}` (`{pair2_str}` @ `{price_val2:.8f}`)\n" \
-                    f"3. `{steps[2]}→{steps[0]}` (`{pair3_str}` @ `{price_val3:.8f}`)\n\n" \
-                    f"⏰ *Timestamp:* `{datetime.now().strftime('%H:%M:%S')}`"
+        message = f" *ARBITRAGE OPPORTUNITY*\n\n" \
+                    f" *Path:* `{path}`\n" \
+                    f" *Estimated Net Profit:* `{profit_percentage:.4f}%`\n\n" \
+                    f" *Example on {investimento_usdt} USDT:*\n" \
+                    f"- Investment: `{investimento_usdt:.2f} USDT`\n" \
+                    f"- Estimated Final: `{finale_usdt:.4f} USDT`\n" \
+                    f"- Net Gain: `{guadagno_usdt:.4f} USDT`\n" \
+                    f"- Estimated Fees: `{commissioni_usdt:.4f} USDT`\n\n" \
+                    f" *Operations and Prices (used in calculation):*\n" \
+                    f"1. `{steps[0]}->{steps[1]}` (`{pair1_str}` @ `{price_val1:.8f}`)\n" \
+                    f"2. `{steps[1]}->{steps[2]}` (`{pair2_str}` @ `{price_val2:.8f}`)\n" \
+                    f"3. `{steps[2]}->{steps[0]}` (`{pair3_str}` @ `{price_val3:.8f}`)\n\n" \
+                    f" *Timestamp:* `{datetime.now().strftime('%H:%M:%S')}`"
         return message
 
     except Exception as e:
         log(f"[MSG][ERR] Critical formatting error: {e} for opp: {opp}")
-        return f"🚨 Error formatting message for `{opp.get('path', 'N/A')}`"
+        return f"[ALERT] Error formatting message for `{opp.get('path', 'N/A')}`"
 
 def adjust_quantity_for_step_size(quantity, step_size):
     """Rounds down the quantity to comply with Binance stepSize."""
@@ -310,127 +346,184 @@ def get_budget_in_asset(start_asset, budget_usdt, prices, existing_pairs):
     """
     if start_asset == 'USDT':
         return budget_usdt
-    # Direction 1: pair <start_asset>/<stable> where start is base.
-    # Bid price = how much stable you receive for 1 start_asset → budget_usdt / bid = start units.
+    # Direction 1: pair <start_asset>/<stable> where start is base, stable is quote.
+    # To buy start_asset paying stable, we cross the ASK. start_units = budget_stable / ask.
     for stable in ('USDT', 'USDC', 'FDUSD'):
         if start_asset in existing_pairs and stable in existing_pairs[start_asset]:
             symbol = existing_pairs[start_asset][stable]
             book = prices.get(symbol)
-            if book and book.get('bid') and book['bid'] > 0:
-                return budget_usdt / book['bid']
-    # Direction 2 (rare): pair <stable>/<start_asset> where start is quote.
-    # Ask price = how much stable needed for 1 unit of other asset → budget_usdt / ask = start units.
+            if book and book.get('ask') and book['ask'] > 0:
+                return budget_usdt / Decimal(str(book['ask']))
+    # Direction 2 (rare): pair <stable>/<start_asset> where stable is base, start_asset is quote.
+    # To get start_asset, we sell stable across the BID. start_units = budget_stable * bid.
     for stable in ('USDT', 'USDC', 'FDUSD'):
         if stable in existing_pairs and start_asset in existing_pairs[stable]:
             symbol = existing_pairs[stable][start_asset]
             book = prices.get(symbol)
-            if book and book.get('ask') and book['ask'] > 0:
-                return budget_usdt / book['ask']
+            if book and book.get('bid') and book['bid'] > 0:
+                return budget_usdt * Decimal(str(book['bid']))
     return None
 
-def find_arbitrage_worker(prices, symbol_info_map_local, profit_threshold, trading_fee, currency_chunk, all_currencies, trade_graph):
-    """Worker process that searches for arbitrage opportunities by navigating a pre-computed graph."""
-    # H1 fix: ensures prec=28 also in worker processes (for explicit clarity).
-    getcontext().prec = 28
-    worker_pid = os.getpid()
-    print(f"[WORKER][{worker_pid}] Starting analysis for {len(currency_chunk)} currencies")
+def build_triangle_index(symbol_info_map_local, trade_graph, all_currencies):
+    """Pre-computes triangles + per-symbol triangle index for event-driven dispatch.
 
-    profitable_opportunities = []
-    stats = {
-        'total_triangles': 0,
-        'non_priority_start': 0,
-        'cannot_convert_budget': 0,
-        'low_profit': {'negative': 0, 'positive': 0},
-        'simulation_failures': {
-            'total': 0, 'FAIL_NO_DATA': 0, 'FAIL_STEP_SIZE': 0,
-            'FAIL_MIN_QTY': 0, 'FAIL_LIQUIDITY': 0, 'FAIL_MIN_NOTIONAL': 0,
-            'UNKNOWN': 0
-        }
-    }
-
+    Returns (triangles, triangle_index) where:
+      triangles: list of (p_a, p_b, p_c) tuples, p_a guaranteed in STARTING_ASSETS.
+      triangle_index: dict[symbol_str, list[triangle]] mapping each Binance pair
+                      to triangles that touch it on any of the 3 legs.
+    """
     existing_pairs = {c: {} for c in all_currencies}
     for symbol, info in symbol_info_map_local.items():
         base, quote = info['base'], info['quote']
         if base not in existing_pairs: existing_pairs[base] = {}
         existing_pairs[base][quote] = symbol
 
-    # Navigate the graph to find only valid paths
-    for p_a in currency_chunk:
+    triangles = []
+    for p_a in STARTING_ASSETS:
         if p_a not in trade_graph: continue
-
         for p_b in trade_graph[p_a]:
             if p_b not in trade_graph: continue
             for p_c in trade_graph[p_b]:
                 if p_c == p_a: continue
-
                 if p_c in trade_graph and p_a in trade_graph[p_c]:
-                    stats['total_triangles'] += 1
+                    triangles.append((p_a, p_b, p_c))
 
-                    if p_a not in STARTING_ASSETS:
-                        stats['non_priority_start'] += 1
-                        continue
+    triangle_index = {}
+    for tri in triangles:
+        a, b, c = tri
+        sym_ab = existing_pairs.get(b, {}).get(a) or existing_pairs.get(a, {}).get(b)
+        sym_bc = existing_pairs.get(c, {}).get(b) or existing_pairs.get(b, {}).get(c)
+        sym_ca = existing_pairs.get(a, {}).get(c) or existing_pairs.get(c, {}).get(a)
+        for sym in (sym_ab, sym_bc, sym_ca):
+            if sym:
+                triangle_index.setdefault(sym, []).append(tri)
+    return triangles, triangle_index
 
-                    try:
-                        # C2 fix: convert USDT budget to units of start_asset using current prices.
-                        # Previously 22 USDT was always passed as "quantity" of start_asset, wrong for BTC/ETH/SOL.
-                        budget_in_asset = get_budget_in_asset(p_a, config.SIMULATION_BUDGET_USDT, prices, existing_pairs)
-                        if budget_in_asset is None or budget_in_asset <= 0:
-                            stats['cannot_convert_budget'] += 1
-                            continue
 
-                        status, result = simulate_trade(p_a, p_b, budget_in_asset, prices, symbol_info_map_local, existing_pairs)
-                        if status != 'SUCCESS':
-                            stats['simulation_failures']['total'] += 1
-                            stats['simulation_failures'][status] = stats['simulation_failures'].get(status, 0) + 1
-                            continue
-                        rate1, amount1, pair1_str = result
+def find_arbitrage_worker(prices, symbol_info_map_local, profit_threshold, trading_fee, triangle_subset, existing_pairs):
+    """Worker process that evaluates a subset of pre-computed triangles for arbitrage.
 
-                        amount1_after_fee = amount1 * (1 - trading_fee)
+    triangle_subset is a list of (p_a, p_b, p_c) tuples already filtered for STARTING_ASSETS
+    and graph closure. existing_pairs is precomputed by bootstrap_indexes (no per-call rebuild).
+    """
+    getcontext().prec = 28
+    worker_pid = os.getpid()
+    print(f"[WORKER][{worker_pid}] Evaluating {len(triangle_subset)} triangles")
 
-                        status, result = simulate_trade(p_b, p_c, amount1_after_fee, prices, symbol_info_map_local, existing_pairs)
-                        if status != 'SUCCESS':
-                            stats['simulation_failures']['total'] += 1
-                            stats['simulation_failures'][status] = stats['simulation_failures'].get(status, 0) + 1
-                            continue
-                        rate2, amount2, pair2_str = result
+    profitable_opportunities = []
+    stats = {
+        'total_triangles': 0,
+        'cannot_convert_budget': 0,
+        'stale_skipped': 0,
+        'low_profit': {'negative': 0, 'positive': 0},
+        'simulation_failures': {
+            'total': 0, 'FAIL_NO_DATA': 0, 'FAIL_STEP_SIZE': 0,
+            'FAIL_MIN_QTY': 0, 'FAIL_LIQUIDITY': 0, 'FAIL_MIN_NOTIONAL': 0,
+            'UNKNOWN': 0
+        },
+        'profit_dist': {
+            'max': None,
+            'buckets': {'lt_neg1pct': 0, 'neg1_to_neg05pct': 0, 'neg05_to_neg01pct': 0, 'neg01_to_0': 0, 'pos': 0}
+        }
+    }
 
-                        amount2_after_fee = amount2 * (1 - trading_fee)
+    now_ts = time.time()
+    staleness_threshold = PRICE_STALENESS_SEC
 
-                        status, result = simulate_trade(p_c, p_a, amount2_after_fee, prices, symbol_info_map_local, existing_pairs)
-                        if status != 'SUCCESS':
-                            stats['simulation_failures']['total'] += 1
-                            stats['simulation_failures'][status] = stats['simulation_failures'].get(status, 0) + 1
-                            continue
-                        rate3, amount3, pair3_str = result
+    for triangle in triangle_subset:
+        p_a, p_b, p_c = triangle
+        stats['total_triangles'] += 1
 
-                        final_amount = amount3 * (1 - trading_fee)
-                        # Dimensionless profit ratio = (final - budget) / budget. Directly comparable to threshold.
-                        profit_ratio = (final_amount - budget_in_asset) / budget_in_asset
+        # Staleness gate: skip if any leg's last book update is missing or older than threshold.
+        sym_ab = existing_pairs.get(p_b, {}).get(p_a) or existing_pairs.get(p_a, {}).get(p_b)
+        sym_bc = existing_pairs.get(p_c, {}).get(p_b) or existing_pairs.get(p_b, {}).get(p_c)
+        sym_ca = existing_pairs.get(p_a, {}).get(p_c) or existing_pairs.get(p_c, {}).get(p_a)
+        is_stale = False
+        for sym in (sym_ab, sym_bc, sym_ca):
+            book = prices.get(sym) if sym else None
+            ts = book.get('ts') if book else None
+            if ts is None or (now_ts - ts) > staleness_threshold:
+                is_stale = True
+                break
+        if is_stale:
+            stats['stale_skipped'] += 1
+            continue
 
-                        if profit_ratio > profit_threshold:
-                             profit_perc = profit_ratio * 100
-                             profitable_opportunities.append({
-                                'path': f"{p_a}→{p_b}→{p_c}→{p_a}",
-                                'profit_perc': f"{profit_perc:.4f}",
-                                'pairs': [pair1_str, pair2_str, pair3_str],
-                                'details': {
-                                    'pairs': (pair1_str, pair2_str, pair3_str),
-                                    'rates': (str(rate1), str(rate2), str(rate3)),
-                                    'prices': (str(prices.get(pair1_str,{}).get('ask' if p_a==symbol_info_map_local[pair1_str]['quote'] else 'bid')),
-                                               str(prices.get(pair2_str,{}).get('ask' if p_b==symbol_info_map_local[pair2_str]['quote'] else 'bid')),
-                                               str(prices.get(pair3_str,{}).get('ask' if p_c==symbol_info_map_local[pair3_str]['quote'] else 'bid')))
-                                }
-                            })
-                        else:
-                            if profit_ratio < 0:
-                                stats['low_profit']['negative'] += 1
-                            else:
-                                stats['low_profit']['positive'] += 1
+        try:
+            budget_in_asset = get_budget_in_asset(p_a, config.SIMULATION_BUDGET_USDT, prices, existing_pairs)
+            if budget_in_asset is None or budget_in_asset <= 0:
+                stats['cannot_convert_budget'] += 1
+                continue
 
-                    except Exception:
-                        stats['simulation_failures']['total'] += 1
-                        stats['simulation_failures']['UNKNOWN'] += 1
-                        continue
+            status, result = simulate_trade(p_a, p_b, budget_in_asset, prices, symbol_info_map_local, existing_pairs)
+            if status != 'SUCCESS':
+                stats['simulation_failures']['total'] += 1
+                stats['simulation_failures'][status] = stats['simulation_failures'].get(status, 0) + 1
+                continue
+            rate1, amount1, amount_in_used_leg1, pair1_str = result
+
+            info1 = symbol_info_map_local.get(pair1_str, {})
+            fee1 = TRADING_FEE_USDC if 'USDC' in (info1.get('base'), info1.get('quote')) else trading_fee
+            amount1_after_fee = amount1 * (1 - fee1)
+
+            status, result = simulate_trade(p_b, p_c, amount1_after_fee, prices, symbol_info_map_local, existing_pairs)
+            if status != 'SUCCESS':
+                stats['simulation_failures']['total'] += 1
+                stats['simulation_failures'][status] = stats['simulation_failures'].get(status, 0) + 1
+                continue
+            rate2, amount2, _, pair2_str = result
+
+            info2 = symbol_info_map_local.get(pair2_str, {})
+            fee2 = TRADING_FEE_USDC if 'USDC' in (info2.get('base'), info2.get('quote')) else trading_fee
+            amount2_after_fee = amount2 * (1 - fee2)
+
+            status, result = simulate_trade(p_c, p_a, amount2_after_fee, prices, symbol_info_map_local, existing_pairs)
+            if status != 'SUCCESS':
+                stats['simulation_failures']['total'] += 1
+                stats['simulation_failures'][status] = stats['simulation_failures'].get(status, 0) + 1
+                continue
+            rate3, amount3, _, pair3_str = result
+
+            info3 = symbol_info_map_local.get(pair3_str, {})
+            fee3 = TRADING_FEE_USDC if 'USDC' in (info3.get('base'), info3.get('quote')) else trading_fee
+            final_amount = amount3 * (1 - fee3)
+            profit_ratio = (final_amount - amount_in_used_leg1) / amount_in_used_leg1
+
+            if stats['profit_dist']['max'] is None or profit_ratio > stats['profit_dist']['max']:
+                stats['profit_dist']['max'] = profit_ratio
+            b = stats['profit_dist']['buckets']
+            if profit_ratio >= 0:        b['pos'] += 1
+            elif profit_ratio > Decimal('-0.001'):  b['neg01_to_0'] += 1
+            elif profit_ratio > Decimal('-0.005'):  b['neg05_to_neg01pct'] += 1
+            elif profit_ratio > Decimal('-0.01'):   b['neg1_to_neg05pct'] += 1
+            else:                                   b['lt_neg1pct'] += 1
+
+            if profit_ratio > profit_threshold:
+                profit_perc = profit_ratio * 100
+                profitable_opportunities.append({
+                    'path': f"{p_a}->{p_b}->{p_c}->{p_a}",
+                    'profit': str(profit_ratio),
+                    'profit_perc': f"{profit_perc:.4f}",
+                    'final': str(config.SIMULATION_BUDGET_USDT * (Decimal('1') + profit_ratio)),
+                    'pairs': [pair1_str, pair2_str, pair3_str],
+                    'details': {
+                        'pairs': (pair1_str, pair2_str, pair3_str),
+                        'rates': (str(rate1), str(rate2), str(rate3)),
+                        'prices': (str(prices.get(pair1_str,{}).get('ask' if p_a==symbol_info_map_local[pair1_str]['quote'] else 'bid')),
+                                   str(prices.get(pair2_str,{}).get('ask' if p_b==symbol_info_map_local[pair2_str]['quote'] else 'bid')),
+                                   str(prices.get(pair3_str,{}).get('ask' if p_c==symbol_info_map_local[pair3_str]['quote'] else 'bid')))
+                    }
+                })
+            else:
+                if profit_ratio < 0:
+                    stats['low_profit']['negative'] += 1
+                else:
+                    stats['low_profit']['positive'] += 1
+
+        except Exception:
+            stats['simulation_failures']['total'] += 1
+            stats['simulation_failures']['UNKNOWN'] += 1
+            continue
 
     print(f"[WORKER][{worker_pid}] Analysis end: {stats['total_triangles']} triangles, {len(profitable_opportunities)} opportunities")
     return {'profitable': profitable_opportunities, 'stats': stats}
@@ -438,45 +531,52 @@ def find_arbitrage_worker(prices, symbol_info_map_local, profit_threshold, tradi
 def simulate_trade(start_asset, end_asset, amount_in, prices, symbol_info, existing_pairs):
     """
     Simulates a single trade.
-    Returns ('SUCCESS', (rate, amount_out, symbol)) or ('FAIL_REASON', None).
+    Returns ('SUCCESS', (rate, amount_out, amount_in_used, symbol)) or ('FAIL_REASON', None).
+
+    amount_in_used = portion of amount_in actually consumed after stepSize truncation.
+    The dust (amount_in - amount_in_used) is NOT spent and would remain in the wallet.
+    Caller must use amount_in_used (not the original amount_in) as the cost basis for
+    profit calculations, otherwise the truncation creates a systematic negative bias.
     """
-    # Buy end_asset with start_asset (pair: end_asset/start_asset)
+    # Buy end_asset with start_asset (pair: end_asset/start_asset, end is base, start is quote)
     if end_asset in existing_pairs and start_asset in existing_pairs[end_asset]:
         symbol = existing_pairs[end_asset][start_asset]
         info = symbol_info.get(symbol)
         book = prices.get(symbol)
         if not info or not book or book['ask'] == 0: return 'FAIL_NO_DATA', None
 
-        price = book['ask']
+        price = Decimal(str(book['ask']))
+        ask_qty = Decimal(str(book['ask_qty']))
         quantity_to_buy = adjust_quantity_for_step_size(amount_in / price, info['stepSize'])
         if quantity_to_buy == 0: return 'FAIL_STEP_SIZE', None
 
-        notional_value = quantity_to_buy * price
+        notional_value = quantity_to_buy * price  # actual start_asset spent
         if quantity_to_buy < info['minQty']: return 'FAIL_MIN_QTY', None
-        if quantity_to_buy > book['ask_qty']: return 'FAIL_LIQUIDITY', None
+        if quantity_to_buy > ask_qty: return 'FAIL_LIQUIDITY', None
         if notional_value < info['minNotional']: return 'FAIL_MIN_NOTIONAL', None
 
-        return 'SUCCESS', (Decimal(1) / price, quantity_to_buy, symbol)
+        return 'SUCCESS', (Decimal(1) / price, quantity_to_buy, notional_value, symbol)
 
-    # Sell start_asset for end_asset (pair: start_asset/end_asset)
+    # Sell start_asset for end_asset (pair: start_asset/end_asset, start is base, end is quote)
     elif start_asset in existing_pairs and end_asset in existing_pairs[start_asset]:
         symbol = existing_pairs[start_asset][end_asset]
         info = symbol_info.get(symbol)
         book = prices.get(symbol)
         if not info or not book or book['bid'] == 0: return 'FAIL_NO_DATA', None
 
-        price = book['bid']
+        price = Decimal(str(book['bid']))
+        bid_qty = Decimal(str(book['bid_qty']))
         quantity_to_sell = adjust_quantity_for_step_size(amount_in, info['stepSize'])
         if quantity_to_sell == 0: return 'FAIL_STEP_SIZE', None
 
-        notional_value = quantity_to_sell * price
+        notional_value = quantity_to_sell * price  # end_asset received
         if quantity_to_sell < info['minQty']: return 'FAIL_MIN_QTY', None
-        if quantity_to_sell > book['bid_qty']: return 'FAIL_LIQUIDITY', None
+        if quantity_to_sell > bid_qty: return 'FAIL_LIQUIDITY', None
         if notional_value < info['minNotional']: return 'FAIL_MIN_NOTIONAL', None
 
-        return 'SUCCESS', (price, notional_value, symbol)
+        return 'SUCCESS', (price, notional_value, quantity_to_sell, symbol)
 
-    return 'FAIL_NO_DATA', None # If the pair does not exist in any direction
+    return 'FAIL_NO_DATA', None
 
 def cpu_stress_test_worker(iterations):
     print(f"[STRESS][WORKER] PID: {os.getpid()} | Iterations: {iterations}")
@@ -485,6 +585,44 @@ def cpu_stress_test_worker(iterations):
         x += i
     print(f"[STRESS][WORKER] PID: {os.getpid()} | Work end")
     return x
+
+
+def bootstrap_indexes():
+    """Builds trade graph + triangle index + existing_pairs once at boot.
+
+    Sets globals: all_currencies_global, all_triangles_global, triangle_index_global,
+    existing_pairs_global, indexes_ready. After this returns, handle_message can push
+    symbols on update_queue and event_loop can dispatch on triangle_index lookups.
+    """
+    global all_currencies_global, all_triangles_global, triangle_index_global, existing_pairs_global, indexes_ready
+
+    all_currencies = sorted(
+        set(info['base'] for info in symbol_info_map.values())
+        | set(info['quote'] for info in symbol_info_map.values())
+    )
+
+    trade_graph = {c: [] for c in all_currencies}
+    for symbol, info in symbol_info_map.items():
+        base, quote = info['base'], info['quote']
+        if base in trade_graph and quote in trade_graph:
+            trade_graph[base].append(quote)
+            trade_graph[quote].append(base)
+
+    triangles, triangle_index = build_triangle_index(symbol_info_map, trade_graph, all_currencies)
+
+    existing_pairs = {c: {} for c in all_currencies}
+    for symbol, info in symbol_info_map.items():
+        base, quote = info['base'], info['quote']
+        if base not in existing_pairs: existing_pairs[base] = {}
+        existing_pairs[base][quote] = symbol
+
+    all_currencies_global = all_currencies
+    all_triangles_global = triangles
+    triangle_index_global = triangle_index
+    existing_pairs_global = existing_pairs
+    indexes_ready = True
+
+    logger.info(f"[BOOTSTRAP] Indexes ready: {len(all_currencies)} currencies, {len(triangles):,} triangles, {len(triangle_index):,} symbols indexed")
 
 async def handle_trading_result(future):
     """Handles the asynchronous trading result"""
@@ -495,63 +633,75 @@ async def handle_trading_result(future):
 
         if result.get('status') == 'SUCCESS':
             profit_pct = result.get('profit_percentage', 0)
-            log(f"✅ Profitable arbitrage: {profit_pct:.4f}%")
+            log(f"[OK] Profitable arbitrage: {profit_pct:.4f}%")
         elif result.get('status') == 'FAILED':
-            log(f"❌ Arbitrage failed: {result.get('error', 'Unknown error')}")
+            log(f"[ERR] Arbitrage failed: {result.get('error', 'Unknown error')}")
 
     except asyncio.TimeoutError:
-        log("⚠️ Trading timeout - process killed")
+        log("[WARN] Trading timeout - process killed")
         # The process will be terminated automatically
     except Exception as e:
-        log(f"❌ Trading result handling error: {e}")
+        log(f"[ERR] Trading result handling error: {e}")
 
-async def main_loop(analysis_executor, trading_executor):
-    """Main loop that coordinates workers and handles results (performance-optimized)."""
+async def event_loop(analysis_executor, trading_executor):
+    """Event-driven dispatch loop.
+
+    Drains update_queue, coalesces book updates within COALESCING_WINDOW_MS,
+    looks up affected triangles via triangle_index_global, chunks them across
+    workers, dispatches. No polling; no periodic full sweep.
+    """
     global total_profitable_opportunities_found, total_low_profit_positive_found
 
+    while not indexes_ready:
+        await asyncio.sleep(0.1)
+    logger.info(f"[EVENT_LOOP] Started. coalescing_window={COALESCING_WINDOW_MS}ms, backpressure_limit={QUEUE_BACKPRESSURE_LIMIT}")
+
     while True:
-        await asyncio.sleep(config.ARBITRAGE_CHECK_INTERVAL)  # Use value from config
-        if not symbol_info_map:
-            logger.info("Symbol map not ready yet, waiting...")
+        first_symbol = await update_queue.get()
+        affected_symbols = {first_symbol}
+
+        await asyncio.sleep(COALESCING_WINDOW_MS / 1000.0)
+
+        while not update_queue.empty():
+            try:
+                affected_symbols.add(update_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
+        affected_triangles = set()
+        for sym in affected_symbols:
+            for tri in triangle_index_global.get(sym, ()):
+                affected_triangles.add(tri)
+
+        if not affected_triangles:
             continue
 
-        logger.info("Starting arbitrage opportunity check...")
+        affected_list = list(affected_triangles)
         start_time = time.perf_counter()
-
         current_prices = dict(prices_cache)
         loop = asyncio.get_running_loop()
 
-        all_currencies = sorted(list(set([info['base'] for info in symbol_info_map.values()] + [info['quote'] for info in symbol_info_map.values()])))
-
-        # Limit the number of workers to reduce CPU load
         num_workers = min(config.MAX_CONCURRENT_ANALYSIS, analysis_executor._max_workers)
-        chunk_size = (len(all_currencies) + num_workers - 1) // num_workers
-        currency_chunks = [all_currencies[i:i + chunk_size] for i in range(0, len(all_currencies), chunk_size)]
+        chunk_size = max(1, (len(affected_list) + num_workers - 1) // num_workers)
+        triangle_chunks = [affected_list[i:i + chunk_size] for i in range(0, len(affected_list), chunk_size)]
 
-        logger.info(f"[WORKER] Work distribution: {num_workers} workers, {len(all_currencies)} currencies, {chunk_size} currencies per worker")
-        for i, chunk in enumerate(currency_chunks):
-            logger.info(f"[WORKER] Worker {i+1}: {len(chunk)} currencies ({chunk[0]}...{chunk[-1]})")
+        logger.info(f"[EVENT_LOOP] Batch: {len(affected_symbols)} symbols -> {len(affected_list)} triangles, {len(triangle_chunks)} chunks (queue_after={update_queue.qsize()})")
 
-        # --- Trading Graph Construction (optimized) ---
-        trade_graph = {c: [] for c in all_currencies}
-        for symbol, info in symbol_info_map.items():
-            base, quote = info['base'], info['quote']
-            if base in trade_graph and quote in trade_graph:
-                trade_graph[base].append(quote)
-                trade_graph[quote].append(base)
-        # ------------------------------------
-
-        futures = [loop.run_in_executor(analysis_executor, find_arbitrage_worker, current_prices, symbol_info_map, config.MIN_PROFIT_THRESHOLD, TRADING_FEE, chunk, all_currencies, trade_graph) for chunk in currency_chunks]
+        futures = [loop.run_in_executor(analysis_executor, find_arbitrage_worker, current_prices, symbol_info_map, config.MIN_PROFIT_THRESHOLD, TRADING_FEE, chunk, existing_pairs_global) for chunk in triangle_chunks]
 
         aggregated_stats = {
             'total_triangles': 0,
-            'non_priority_start': 0,
             'cannot_convert_budget': 0,
+            'stale_skipped': 0,
             'low_profit': {'negative': 0, 'positive': 0},
             'simulation_failures': {
                 'total': 0, 'FAIL_NO_DATA': 0, 'FAIL_STEP_SIZE': 0,
                 'FAIL_MIN_QTY': 0, 'FAIL_LIQUIDITY': 0, 'FAIL_MIN_NOTIONAL': 0,
                 'UNKNOWN': 0
+            },
+            'profit_dist': {
+                'max': None,
+                'buckets': {'lt_neg1pct': 0, 'neg1_to_neg05pct': 0, 'neg05_to_neg01pct': 0, 'neg01_to_0': 0, 'pos': 0}
             }
         }
         total_profitable_found = 0
@@ -567,8 +717,8 @@ async def main_loop(analysis_executor, trading_executor):
                     # Aggregate statistics
                     if worker_stats:
                         aggregated_stats['total_triangles'] += worker_stats.get('total_triangles', 0)
-                        aggregated_stats['non_priority_start'] += worker_stats.get('non_priority_start', 0)
                         aggregated_stats['cannot_convert_budget'] += worker_stats.get('cannot_convert_budget', 0)
+                        aggregated_stats['stale_skipped'] += worker_stats.get('stale_skipped', 0)
 
                         # Aggregate low_profit
                         low_profit_stats = worker_stats.get('low_profit', {})
@@ -580,6 +730,15 @@ async def main_loop(analysis_executor, trading_executor):
                         for key, value in sim_fail_stats.items():
                             aggregated_stats['simulation_failures'][key] += value
 
+                        # Aggregate profit_dist (max + bucket histogram)
+                        worker_dist = worker_stats.get('profit_dist', {})
+                        worker_max = worker_dist.get('max')
+                        if worker_max is not None:
+                            if aggregated_stats['profit_dist']['max'] is None or worker_max > aggregated_stats['profit_dist']['max']:
+                                aggregated_stats['profit_dist']['max'] = worker_max
+                        for bkey, bval in worker_dist.get('buckets', {}).items():
+                            aggregated_stats['profit_dist']['buckets'][bkey] += bval
+
                     if not opportunities: continue
 
                     total_profitable_found += len(opportunities)
@@ -588,7 +747,7 @@ async def main_loop(analysis_executor, trading_executor):
                         path, profit_perc_str = opp.get('path'), opp.get('profit_perc')
                         if not path: continue
 
-                        triangle_key = tuple(sorted(path.split('→')[:3]))
+                        triangle_key = tuple(path.split('->')[:3])
                         current_time = time.time()
 
                         if (current_time - profitable_opportunities_set.get(triangle_key, 0)) > OPPORTUNITY_COOLDOWN:
@@ -596,8 +755,10 @@ async def main_loop(analysis_executor, trading_executor):
                             total_profitable_opportunities_found += 1 # Increment global counter
 
                             # --- LOG AND FILE: ALWAYS BEFORE NOTIFY ---
-                            profit_perc_val = float(profit_perc_str)
-                            guadagno_stimato = config.SIMULATION_BUDGET_USDT * (profit_perc_val / 100)
+                            # Keep the whole scope on Decimal to avoid float contamination
+                            # downstream (the previous mixed Decimal*float caused TypeError + false positives).
+                            profit_perc_val = Decimal(profit_perc_str)
+                            guadagno_stimato = config.SIMULATION_BUDGET_USDT * profit_perc_val / Decimal('100')
                             # Calculate optimal amount and volumes
                             try:
                                 importo_ottimale, volumi = calcola_importo_ottimale_con_buffer(opp['pairs'], current_prices, symbol_info_map)
@@ -632,7 +793,7 @@ async def main_loop(analysis_executor, trading_executor):
                     logger.error(f"Worker result processing error: {e}")
 
         except asyncio.TimeoutError:
-            logger.warning("⚠️ Worker analysis timeout (30s)")
+            logger.warning("[WARN] Worker analysis timeout (30s)")
 
         # Update global near-profitable counter
         total_low_profit_positive_found += aggregated_stats['low_profit']['positive']
@@ -651,8 +812,8 @@ async def main_loop(analysis_executor, trading_executor):
         if should_log_detailed:
             logger.info("--- Analysis Cycle Statistics ---")
             logger.info(f"Analysis Duration: {duration_ms:.2f} ms")
-            logger.info(f"Valid triangles found: {aggregated_stats['total_triangles']:,}")
-            logger.info(f"  - Discarded (non-priority start): {aggregated_stats['non_priority_start']:,}")
+            logger.info(f"Triangles evaluated: {aggregated_stats['total_triangles']:,}")
+            logger.info(f"  - Discarded (stale prices >{PRICE_STALENESS_SEC}s): {aggregated_stats['stale_skipped']:,}")
             logger.info(f"  - Discarded (budget not convertible to unit asset): {aggregated_stats['cannot_convert_budget']:,}")
             logger.info(f"  - Discarded (simulation failure): {total_sim_failures:,}")
 
@@ -670,6 +831,17 @@ async def main_loop(analysis_executor, trading_executor):
             if total_low_profit > 0:
                 logger.info(f"    - Negative (loss): {aggregated_stats['low_profit']['negative']:,}")
                 logger.info(f"    - Positive (below threshold): {aggregated_stats['low_profit']['positive']:,}")
+            # Profit distribution telemetry (fix validation): max + histogram buckets
+            dist = aggregated_stats.get('profit_dist', {})
+            dist_max = dist.get('max')
+            buckets = dist.get('buckets', {})
+            if dist_max is not None:
+                # Derived gross edge (pre-fee): post-fee max + compound fee. Approximation valid
+                # for small fees (1 - (1-f)^3 ~ 3f). Tells us if opportunities exist at fee=0.
+                fee_compound = Decimal(1) - (Decimal(1) - TRADING_FEE) ** 3
+                gross_max = dist_max + fee_compound
+                logger.info(f"  Profit ratio distribution: max={float(dist_max)*100:+.4f}% (post-fee) | gross_max~{float(gross_max)*100:+.4f}% (pre-fee, derived)")
+                logger.info(f"  Buckets (post-fee): <-1%={buckets.get('lt_neg1pct',0):,} -1/-0.5%={buckets.get('neg1_to_neg05pct',0):,} -0.5/-0.1%={buckets.get('neg05_to_neg01pct',0):,} -0.1/0%={buckets.get('neg01_to_0',0):,} >=0%={buckets.get('pos',0):,}")
             logger.info(f"Profitable Opportunities Found: {total_profitable_found}")
             logger.info("------------------------------------")
         else:
@@ -736,10 +908,10 @@ async def hourly_summary_task(bot_start_time):
         uptime_str = f"{days}d {hours}h {minutes}m"
 
         summary_message = (
-            f"🕒 *Hourly Summary*\n\n"
-            f"✅ *Uptime:* `{uptime_str}`\n"
-            f"💰 *Opportunities Found:* `{total_profitable_opportunities_found}`\n"
-            f"🤏 *Near Profitable (below threshold):* `{total_low_profit_positive_found}`"
+            f" *Hourly Summary*\n\n"
+            f"[OK] *Uptime:* `{uptime_str}`\n"
+            f" *Opportunities Found:* `{total_profitable_opportunities_found}`\n"
+            f" *Near Profitable (below threshold):* `{total_low_profit_positive_found}`"
         )
         await send_telegram_notification(summary_message)
 
@@ -787,7 +959,10 @@ def calcola_importo_ottimale_con_buffer(pairs, prices, symbol_info_map):
     return importo_ottimale, volumi
 
 async def main():
-    global symbol_info_map
+    global symbol_info_map, update_queue
+
+    # Initialize the asyncio.Queue inside the running loop (must own it).
+    update_queue = asyncio.Queue()
 
     # Print configuration at startup
     config.print_config_summary()
@@ -796,7 +971,7 @@ async def main():
     if config.AUTO_TRADE_ENABLED:
         errors = config.validate_config()
         if errors:
-            logger.error("❌ Configuration errors detected:")
+            logger.error("[ERR] Configuration errors detected:")
             for error in errors:
                 logger.error(f"  - {error}")
             logger.error("The bot will continue with analysis only (trading disabled)")
@@ -806,12 +981,15 @@ async def main():
     bot_start_time = time.time()
 
     logger.info("Starting Binance triangular arbitrage program...")
-    await send_telegram_notification("🤖 Starting arbitrage bot...")
+    await send_telegram_notification(" Starting arbitrage bot...")
 
     symbols, symbol_info_map = await get_exchange_symbols()
     if not symbols:
         logger.error("No symbols obtained. Cannot proceed.")
         return
+
+    # Build event-driven indexes once, before websocket starts pushing updates.
+    bootstrap_indexes()
 
     symbol_groups = [symbols[i:i + SYMBOLS_PER_CONNECTION] for i in range(0, len(symbols), SYMBOLS_PER_CONNECTION)]
 
@@ -820,7 +998,7 @@ async def main():
         with ProcessPoolExecutor(max_workers=config.TRADING_CORES) as trading_executor:
             websocket_tasks = [websocket_manager(group) for group in symbol_groups]
             all_tasks = websocket_tasks + [
-                main_loop(analysis_executor, trading_executor),
+                event_loop(analysis_executor, trading_executor),
                 hourly_summary_task(bot_start_time)
             ]
             await asyncio.gather(*all_tasks)
