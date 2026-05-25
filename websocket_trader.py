@@ -71,13 +71,13 @@ class BinanceWebSocketTrader:
                 close_timeout=10
             )
             self.connected = True
-            logger.info("✅ WebSocket trading connection established")
+            logger.info("[OK] WebSocket trading connection established")
 
             # Start task to keep the connection alive
             asyncio.create_task(self._keep_alive())
 
         except Exception as e:
-            logger.error(f"❌ WebSocket trading connection error: {e}")
+            logger.error(f"[ERR] WebSocket trading connection error: {e}")
             self.connected = False
             raise
 
@@ -86,7 +86,7 @@ class BinanceWebSocketTrader:
         if _is_ws_alive(self.websocket):
             await self.websocket.close()
             self.connected = False
-            logger.info("🔌 WebSocket trading connection closed")
+            logger.info(" WebSocket trading connection closed")
 
     async def _keep_alive(self):
         """Keeps the WebSocket connection alive"""
@@ -97,18 +97,18 @@ class BinanceWebSocketTrader:
                     await self.websocket.ping()
                     self.last_ping = time.time()
             except Exception as e:
-                logger.warning(f"⚠️ WebSocket keep-alive error: {e}")
+                logger.warning(f"[WARN] WebSocket keep-alive error: {e}")
                 await self._reconnect()
 
     async def _reconnect(self):
         """Reconnects automatically"""
         try:
-            logger.info("🔄 Reconnecting WebSocket trading...")
+            logger.info(" Reconnecting WebSocket trading...")
             await self.disconnect()
             await asyncio.sleep(1)
             await self.connect()
         except Exception as e:
-            logger.error(f"❌ WebSocket reconnection error: {e}")
+            logger.error(f"[ERR] WebSocket reconnection error: {e}")
 
     def _generate_signature(self, params: Dict) -> str:
         """Generates HMAC signature for authentication"""
@@ -157,7 +157,7 @@ class BinanceWebSocketTrader:
         try:
             # Send order
             await self.websocket.send(json.dumps(request))
-            logger.info(f"⚡ WS ORDER SENT: {side} {quantity} {symbol}")
+            logger.info(f" WS ORDER SENT: {side} {quantity} {symbol}")
 
             # Wait for response with timeout
             response = await asyncio.wait_for(
@@ -171,7 +171,7 @@ class BinanceWebSocketTrader:
             # Verify response
             if 'result' in response_data and response_data['result'].get('status') == 'FILLED':
                 result = response_data['result']
-                logger.info(f"✅ WS ORDER SUCCESS: {side} {quantity} {symbol} ({execution_time:.1f}ms)")
+                logger.info(f"[OK] WS ORDER SUCCESS: {side} {quantity} {symbol} ({execution_time:.1f}ms)")
                 
                 return {
                     'status': 'SUCCESS',
@@ -185,14 +185,14 @@ class BinanceWebSocketTrader:
                 }
             else:
                 error_msg = response_data.get('error', {}).get('msg', 'Unknown error')
-                logger.error(f"❌ WS ORDER ERROR: {error_msg}")
+                logger.error(f"[ERR] WS ORDER ERROR: {error_msg}")
                 raise BinanceAPIException(f"WebSocket order failed: {error_msg}")
                 
         except asyncio.TimeoutError:
-            logger.error(f"⏰ WS ORDER TIMEOUT: {side} {quantity} {symbol}")
+            logger.error(f" WS ORDER TIMEOUT: {side} {quantity} {symbol}")
             raise BinanceAPIException("WebSocket order timeout")
         except Exception as e:
-            logger.error(f"❌ WS ORDER EXCEPTION: {e}")
+            logger.error(f"[ERR] WS ORDER EXCEPTION: {e}")
             raise
     
     async def get_account_info(self) -> Dict:
@@ -216,7 +216,7 @@ class BinanceWebSocketTrader:
             response = await asyncio.wait_for(self.websocket.recv(), timeout=5.0)
             return json.loads(response)
         except Exception as e:
-            logger.error(f"❌ WS ACCOUNT INFO ERROR: {e}")
+            logger.error(f"[ERR] WS ACCOUNT INFO ERROR: {e}")
             raise
     
     def is_connected(self) -> bool:
@@ -246,9 +246,9 @@ class HybridTradingExecutor:
                     config.BINANCE_SECRET_KEY,
                     testnet=config.DRY_RUN_MODE
                 )
-                logger.info(f"✅ REST fallback client initialized (testnet={config.DRY_RUN_MODE})")
+                logger.info(f"[OK] REST fallback client initialized (testnet={config.DRY_RUN_MODE})")
             except Exception as e:
-                logger.error(f"❌ REST client init failed: {e}")
+                logger.error(f"[ERR] REST client init failed: {e}")
                 self.rest_client = None
 
     async def execute_market_order(self, symbol: str, side: str, quantity: Decimal) -> Dict:
@@ -266,16 +266,16 @@ class HybridTradingExecutor:
 
             except Exception as e:
                 self.ws_failures += 1
-                logger.warning(f"⚠️ WebSocket failed ({self.ws_failures}/{self.max_ws_failures}): {e}")
+                logger.warning(f"[WARN] WebSocket failed ({self.ws_failures}/{self.max_ws_failures}): {e}")
 
                 # Disable WebSocket if too many failures
                 if self.ws_failures >= self.max_ws_failures:
-                    logger.warning("🔄 Too many WebSocket failures, switching to REST API")
+                    logger.warning(" Too many WebSocket failures, switching to REST API")
                     self.use_websocket = False
 
         # Fallback to REST API
         if self.rest_client:
-            logger.info(f"📡 Using REST API for {side} {quantity} {symbol}")
+            logger.info(f" Using REST API for {side} {quantity} {symbol}")
             return await self._execute_rest_order(symbol, side, quantity)
         else:
             raise Exception("No trading client available")
@@ -297,7 +297,7 @@ class HybridTradingExecutor:
             if config.DRY_RUN_MODE:
                 # Test order: validates parameters but does not execute
                 await asyncio.to_thread(self.rest_client.create_test_order, **params)
-                logger.info(f"🧪 REST TEST ORDER: {side} {quantity_str} {symbol}")
+                logger.info(f"[TEST] REST TEST ORDER: {side} {quantity_str} {symbol}")
                 return {
                     'status': 'TEST_SUCCESS',
                     'symbol': symbol,
@@ -309,7 +309,7 @@ class HybridTradingExecutor:
                 }
             else:
                 result = await asyncio.to_thread(self.rest_client.create_order, **params)
-                logger.info(f"📈 REST REAL ORDER: {side} {quantity_str} {symbol}")
+                logger.info(f" REST REAL ORDER: {side} {quantity_str} {symbol}")
                 price = Decimal(result['fills'][0]['price']) if result.get('fills') else None
                 return {
                     'status': 'SUCCESS',

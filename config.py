@@ -110,8 +110,8 @@ def validate_config():
 def print_config_summary():
     """Prints a summary of the configuration"""
     print("=== AUTOMATED TRADING CONFIGURATION ===")
-    print(f"Trading Enabled: {'✅ YES' if AUTO_TRADE_ENABLED else '❌ NO'}")
-    print(f"Test Mode: {'✅ YES' if DRY_RUN_MODE else '❌ NO'}")
+    print(f"Trading Enabled: {'[OK] YES' if AUTO_TRADE_ENABLED else '[ERR] NO'}")
+    print(f"Test Mode: {'[OK] YES' if DRY_RUN_MODE else '[ERR] NO'}")
     print(f"Budget per Trade: {TRADE_BUDGET_USDT} USDT")
     print(f"Trading Timeout: {TRADING_TIMEOUT} seconds")
     print(f"Total Cores: {TOTAL_CORES}")
@@ -122,11 +122,11 @@ def print_config_summary():
     if AUTO_TRADE_ENABLED:
         errors = validate_config()
         if errors:
-            print("⚠️ CONFIGURATION ERRORS:")
+            print("[WARN] CONFIGURATION ERRORS:")
             for error in errors:
                 print(f"  - {error}")
         else:
-            print("✅ Configuration valid")
+            print("[OK] Configuration valid")
 
 # H2 fix: removed duplicate block overwriting initial definitions (drift risk).
 # All constants (AUTO_TRADE_ENABLED, DRY_RUN_MODE, TRADE_BUDGET_USDT, SIMULATION_BUDGET_USDT)

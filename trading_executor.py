@@ -45,11 +45,11 @@ class TradingExecutor:
                     config.BINANCE_SECRET_KEY,
                     testnet=config.DRY_RUN_MODE
                 )
-                logger.info(f"✅ Binance client initialized (Testnet: {config.DRY_RUN_MODE})")
+                logger.info(f"[OK] Binance client initialized (Testnet: {config.DRY_RUN_MODE})")
             else:
-                logger.info("ℹ️ Automated trading disabled - client not initialized")
+                logger.info("[INFO] Automated trading disabled - client not initialized")
         except Exception as e:
-            logger.error(f"❌ Binance client initialization error: {e}")
+            logger.error(f"[ERR] Binance client initialization error: {e}")
             self.client = None
 
     def _init_hybrid_executor(self):
@@ -57,11 +57,11 @@ class TradingExecutor:
         try:
             if config.AUTO_TRADE_ENABLED and config.BINANCE_API_KEY and config.BINANCE_SECRET_KEY:
                 self.hybrid_executor = HybridTradingExecutor()
-                logger.info("✅ WebSocket/REST hybrid executor initialized")
+                logger.info("[OK] WebSocket/REST hybrid executor initialized")
             else:
-                logger.info("ℹ️ Hybrid executor not initialized (trading disabled or credentials missing)")
+                logger.info("[INFO] Hybrid executor not initialized (trading disabled or credentials missing)")
         except Exception as e:
-            logger.error(f"❌ Hybrid executor initialization error: {e}")
+            logger.error(f"[ERR] Hybrid executor initialization error: {e}")
             self.hybrid_executor = None
 
     def _log_trade_result(self, result: Dict, is_error: bool = False):
@@ -120,7 +120,7 @@ class TradingExecutor:
             if config.DRY_RUN_MODE:
                 # Test mode - use test order
                 result = self.client.create_test_order(**order_params)
-                logger.info(f"🧪 TEST ORDER: {side} {quantity_str} {symbol}")
+                logger.info(f"[TEST] TEST ORDER: {side} {quantity_str} {symbol}")
                 return {
                     'status': 'TEST_SUCCESS',
                     'symbol': symbol,
@@ -132,7 +132,7 @@ class TradingExecutor:
             else:
                 # Real order
                 result = self.client.create_order(**order_params)
-                logger.info(f"📈 REAL ORDER: {side} {quantity_str} {symbol}")
+                logger.info(f" REAL ORDER: {side} {quantity_str} {symbol}")
                 return {
                     'status': 'SUCCESS',
                     'symbol': symbol,
@@ -177,10 +177,10 @@ class TradingExecutor:
             result = await self.execute_market_order(symbol, side, quantity)
 
             if result['status'] in ['SUCCESS', 'TEST_SUCCESS']:
-                logger.warning(f"🆘 Emergency liquidation completed via {side} {symbol}: {quantity} {asset} -> {target_asset}")
+                logger.warning(f"[SOS] Emergency liquidation completed via {side} {symbol}: {quantity} {asset} -> {target_asset}")
                 return result
             else:
-                logger.error(f"❌ Emergency liquidation failed: {result}")
+                logger.error(f"[ERR] Emergency liquidation failed: {result}")
                 return result
 
         except Exception as e:
@@ -209,7 +209,7 @@ class TradingExecutor:
         timestamp = trading_data['timestamp']
 
         # Path parsing
-        steps = path.split('→')
+        steps = path.split('->')
         if len(steps) != 4:
             return {'status': 'INVALID_PATH', 'error': f'Invalid path: {path}'}
 
@@ -218,7 +218,7 @@ class TradingExecutor:
         intermediate2 = steps[2]
         end_asset = steps[3]  # Should equal start_asset
 
-        logger.info(f"🚀 Starting arbitrage: {path}")
+        logger.info(f" Starting arbitrage: {path}")
 
         # Safety check
         if self.is_trading:
@@ -249,7 +249,7 @@ class TradingExecutor:
             if initial_balance < config.TRADE_BUDGET_USDT:
                 raise ValueError(f"Insufficient balance: {initial_balance} {start_asset}")
 
-            logger.info(f"💰 Initial balance: {initial_balance} {start_asset} (check: {timing['balance_check']:.1f}ms)")
+            logger.info(f" Initial balance: {initial_balance} {start_asset} (check: {timing['balance_check']:.1f}ms)")
 
             # Step 2: Trade 1 (start_asset -> intermediate1)
             trade1_start = time.time()
@@ -263,7 +263,7 @@ class TradingExecutor:
 
             quantity1 = trade1_result['quantity']
             method1 = trade1_result.get('method', 'unknown')
-            logger.info(f"✅ Trade 1 completed: {quantity1} {intermediate1} (time: {timing['trade1']:.1f}ms, method: {method1})")
+            logger.info(f"[OK] Trade 1 completed: {quantity1} {intermediate1} (time: {timing['trade1']:.1f}ms, method: {method1})")
 
             # Step 3: Trade 2 (intermediate1 -> intermediate2)
             trade2_start = time.time()
@@ -274,7 +274,7 @@ class TradingExecutor:
 
             if trade2_result['status'] not in ['SUCCESS', 'TEST_SUCCESS']:
                 # Emergency liquidation
-                logger.warning(f"⚠️ Trade 2 failed, emergency liquidation...")
+                logger.warning(f"[WARN] Trade 2 failed, emergency liquidation...")
                 liquidation_result = await self.emergency_liquidation(
                     intermediate1, start_asset, quantity1
                 )
@@ -282,7 +282,7 @@ class TradingExecutor:
 
             quantity2 = trade2_result['quantity']
             method2 = trade2_result.get('method', 'unknown')
-            logger.info(f"✅ Trade 2 completed: {quantity2} {intermediate2} (time: {timing['trade2']:.1f}ms, method: {method2})")
+            logger.info(f"[OK] Trade 2 completed: {quantity2} {intermediate2} (time: {timing['trade2']:.1f}ms, method: {method2})")
 
             # Step 4: Trade 3 (intermediate2 -> start_asset)
             trade3_start = time.time()
@@ -293,7 +293,7 @@ class TradingExecutor:
 
             if trade3_result['status'] not in ['SUCCESS', 'TEST_SUCCESS']:
                 # Emergency liquidation
-                logger.warning(f"⚠️ Trade 3 failed, emergency liquidation...")
+                logger.warning(f"[WARN] Trade 3 failed, emergency liquidation...")
                 liquidation_result = await self.emergency_liquidation(
                     intermediate2, start_asset, quantity2
                 )
@@ -301,7 +301,7 @@ class TradingExecutor:
 
             final_quantity = trade3_result['quantity']
             method3 = trade3_result.get('method', 'unknown')
-            logger.info(f"✅ Trade 3 completed: {final_quantity} {start_asset} (time: {timing['trade3']:.1f}ms, method: {method3})")
+            logger.info(f"[OK] Trade 3 completed: {final_quantity} {start_asset} (time: {timing['trade3']:.1f}ms, method: {method3})")
 
             # Profit/loss calculation
             profit = final_quantity - config.TRADE_BUDGET_USDT
@@ -325,7 +325,7 @@ class TradingExecutor:
             }
 
             # Detailed timing log
-            logger.info(f"⏱️ TIMING BREAKDOWN:")
+            logger.info(f" TIMING BREAKDOWN:")
             logger.info(f"  - Balance check: {timing['balance_check']:.1f}ms")
             logger.info(f"  - Trade 1: {timing['trade1']:.1f}ms ({method1})")
             logger.info(f"  - Trade 2: {timing['trade2']:.1f}ms ({method2})")
@@ -335,7 +335,7 @@ class TradingExecutor:
             # Hybrid executor performance stats
             if self.hybrid_executor:
                 perf_stats = self.hybrid_executor.get_performance_stats()
-                logger.info(f"📊 PERFORMANCE STATS: {perf_stats}")
+                logger.info(f" PERFORMANCE STATS: {perf_stats}")
 
             # Log and notify
             self._log_trade_result(result)
@@ -343,9 +343,9 @@ class TradingExecutor:
 
             # Telegram notification with timing and methods
             if profit_percentage > 0:
-                message = f"✅ ARBITRAGE COMPLETED\n\n🔄 Path: {path}\n💰 Profit: {profit_percentage:.4f}%\n💵 Gain: {profit:.4f} {start_asset}\n⏱️ Total Time: {timing['total']:.1f}ms\n📊 Breakdown:\n  • Balance: {timing['balance_check']:.1f}ms\n  • Trade 1: {timing['trade1']:.1f}ms ({method1})\n  • Trade 2: {timing['trade2']:.1f}ms ({method2})\n  • Trade 3: {timing['trade3']:.1f}ms ({method3})"
+                message = f"[OK] ARBITRAGE COMPLETED\n\n Path: {path}\n Profit: {profit_percentage:.4f}%\n Gain: {profit:.4f} {start_asset}\n Total Time: {timing['total']:.1f}ms\n Breakdown:\n  - Balance: {timing['balance_check']:.1f}ms\n  - Trade 1: {timing['trade1']:.1f}ms ({method1})\n  - Trade 2: {timing['trade2']:.1f}ms ({method2})\n  - Trade 3: {timing['trade3']:.1f}ms ({method3})"
             else:
-                message = f"⚠️ ARBITRAGE COMPLETED (LOSS)\n\n🔄 Path: {path}\n📉 Loss: {profit_percentage:.4f}%\n💸 Loss amount: {abs(profit):.4f} {start_asset}\n⏱️ Total Time: {timing['total']:.1f}ms\n📊 Breakdown:\n  • Balance: {timing['balance_check']:.1f}ms\n  • Trade 1: {timing['trade1']:.1f}ms ({method1})\n  • Trade 2: {timing['trade2']:.1f}ms ({method2})\n  • Trade 3: {timing['trade3']:.1f}ms ({method3})"
+                message = f"[WARN] ARBITRAGE COMPLETED (LOSS)\n\n Path: {path}\n Loss: {profit_percentage:.4f}%\n Loss amount: {abs(profit):.4f} {start_asset}\n Total Time: {timing['total']:.1f}ms\n Breakdown:\n  - Balance: {timing['balance_check']:.1f}ms\n  - Trade 1: {timing['trade1']:.1f}ms ({method1})\n  - Trade 2: {timing['trade2']:.1f}ms ({method2})\n  - Trade 3: {timing['trade3']:.1f}ms ({method3})"
 
             self._send_telegram_notification(message)
 
@@ -366,7 +366,7 @@ class TradingExecutor:
             self.failure_count += 1
 
             # Telegram notification with timing
-            message = f"❌ ARBITRAGE FAILED\n\n🔄 Path: {path}\n🚨 Error: {str(e)}\n⏱️ Time: {timing['total']:.1f}ms"
+            message = f"[ERR] ARBITRAGE FAILED\n\n Path: {path}\n[ALERT] Error: {str(e)}\n Time: {timing['total']:.1f}ms"
             self._send_telegram_notification(message)
 
             return error_result
